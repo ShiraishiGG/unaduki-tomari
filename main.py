@@ -533,8 +533,19 @@ def _user_style(user_id: int) -> str:
     return (prefs or {}).get("style", "normal")
 
 
-async def _call_gemini(system_prompt: str, user_content: str, max_tokens: int = 60) -> str | None:
-    """Gemini APIを1回だけ叩いて短文を1つ生成する。未設定/失敗時はNone(呼び出し側でフォールバック)。"""
+async def _call_gemini(
+    system_prompt: str,
+    user_content: str,
+    max_tokens: int = 60,
+    history: list[dict] | None = None,
+) -> str | None:
+    """Gemini APIを1回叩いて短文を1つ生成する。未設定/失敗時はNone(呼び出し側でフォールバック)。
+
+    historyを渡すと、会話履歴をテキストとして1つのuserパートに埋め込むのではなく、
+    Gemini API本来のマルチターン形式(role: user/model を交互に並べたcontents配列)として渡す。
+    こうすることで「自分の発言」と「相手の発言」の区別をモデル側の構造理解に任せられる。
+    historyの各要素は {"role": "user"|"model", "parts": [{"text": ...}]} の形式。
+    """
     if not GEMINI_API_KEY:
         return None
 
@@ -542,9 +553,11 @@ async def _call_gemini(system_prompt: str, user_content: str, max_tokens: int = 
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     )
+    contents = list(history) if history else []
+    contents.append({"role": "user", "parts": [{"text": user_content}]})
     payload = {
         "systemInstruction": {"parts": [{"text": system_prompt}]},
-        "contents": [{"parts": [{"text": user_content}]}],
+        "contents": contents,
         "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.9},
     }
     try:
@@ -584,48 +597,52 @@ async def _mention_called_reply(user_id: int) -> str:
 
 
 async def _mention_content_reply(
-    user_id: int, content: str, context_text: str | None = None
+    message: discord.Message, content: str, use_context: bool = False
 ) -> str:
     """メンション+内容(1ターン目)への返答を1文生成する。
-    context_textが渡された場合は、直近の会話の流れも踏まえて反応する
-    (「どう思う？」等、話の流れが無いと答えられない一言用)。
+    use_context=Trueの場合、直近の会話履歴をマルチターンのcontentsとして渡し、
+    話の流れを踏まえて反応する(「どう思う？」等、話の流れが無いと答えられない一言用)。
     """
     system_prompt = (
-        _persona_prompt(_user_style(user_id))
+        _persona_prompt(_user_style(message.author.id))
         + "話しかけられた内容に対して、一言だけ反応してください。"
         + "具体的な手順や長い説明は書かず、素っ気なくても親身でも構わないので気の利いた一文で返してください。"
         + "1文だけ、句点なし、絵文字なし、前置きや説明は付けず反応の一言だけを返してください。"
     )
-    if context_text:
+    history = None
+    if use_context:
         system_prompt += "直近の会話の流れを踏まえた上で、話しかけられた内容に反応してください。"
-        user_content = f"直近の会話:\n{context_text}\n\n話しかけられた内容: {content}"
-    else:
-        user_content = content
-    reply = await _call_gemini(system_prompt, user_content)
+        history = _merge_consecutive_turns(await _fetch_recent_turns(message))
+    reply = await _call_gemini(system_prompt, content, history=history)
     return reply or MENTION_CONTENT_FALLBACK
 
 
-async def _mention_followup_reply(
-    user_id: int, original_text: str, bot_reply: str, followup_text: str
-) -> str:
-    """2ターン目(相槌)を1文生成する"""
+MENTION_FOLLOWUP_CONTEXT_LIMIT = int(os.environ.get("MENTION_FOLLOWUP_CONTEXT_LIMIT", "12"))
+
+
+async def _context_chat_reply(message: discord.Message, content: str) -> str:
+    """2ターン目(相槌)を、保存された「1回目の発言/Botの返答」の2文字列だけでなく、
+    実際の直近チャンネル履歴(マルチターンのcontents)を踏まえて生成する。
+    サーバーのチャンネルは複数人が発言しうるので、話しかけた本人とBot自身の発言だけに絞る
+    (2ターンで打ち切る仕組み自体は on_message 側の pop 処理のままで変更しない)。
+    """
+    history = _merge_consecutive_turns(
+        await _fetch_recent_turns(
+            message, limit=MENTION_FOLLOWUP_CONTEXT_LIMIT, only_user_and_bot=True
+        )
+    )
     system_prompt = (
-        _persona_prompt(_user_style(user_id))
+        _persona_prompt(_user_style(message.author.id))
         + "直前の会話の流れを踏まえて、一言を考えてください。"
         + "1文だけ、句点なし、絵文字なし、これ以降のやり取りはありません、前置きや説明は付けず一言だけを返してください。"
     )
-    user_content = (
-        f"1回目の相手の発言: {original_text}\n"
-        f"それに対するあなたの返答: {bot_reply}\n"
-        f"相手の返信: {followup_text}"
-    )
-    reply = await _call_gemini(system_prompt, user_content)
+    reply = await _call_gemini(system_prompt, content, history=history)
     return reply or MENTION_FOLLOWUP_FALLBACK
 
 
 async def _reminder_recall_reply(user_id: int, original_text: str) -> str:
     """リマインド送信後に「なんのこと？」と聞かれた時、元の予定の文言をほぼそのまま伝える。
-    こちらは会話の相槌(_mention_followup_reply)より原型率を高くしたいので、
+    こちらは会話の相槌(_context_chat_reply)より原型率を高くしたいので、
     専用のプロンプトで「言い換えず元の文言を使う」ことを強く指示する。
     """
     system_prompt = (
@@ -786,16 +803,43 @@ MENTION_CONTEXT_TRIGGER_PHRASES = {"どう思う？", "ヤバくない？"}
 MENTION_CONTEXT_READ_LIMIT = 10
 
 
-async def _fetch_recent_context(
-    message: discord.Message, limit: int = MENTION_CONTEXT_READ_LIMIT
-) -> str:
-    """話しかけられたメッセージより前の直近limit件を、古い→新しい順のテキストにして返す。"""
-    lines = []
+async def _fetch_recent_turns(
+    message: discord.Message,
+    limit: int = MENTION_CONTEXT_READ_LIMIT,
+    only_user_and_bot: bool = False,
+) -> list[dict]:
+    """話しかけられたメッセージより前の直近limit件を、古い→新しい順の
+    role付きturn([{"role": "user"|"model", "parts": [{"text": ...}]}])にして返す。
+    Botの発言は role="model"、それ以外は全員 role="user" として扱う
+    (Gemini側のroleは2種類しかなく、サーバーの他の人の発言もuser側に含めるしかないため)。
+    only_user_and_bot=True の場合、話しかけた本人とBot自身の発言だけに絞る
+    (サーバーのチャンネルは複数人が発言するので、無関係な人の発言で文脈がブレるのを防ぐ)。
+    """
+    turns = []
     async for msg in message.channel.history(limit=limit, before=message):
-        if msg.content:
-            lines.append(f"{msg.author.display_name}: {msg.content}")
-    lines.reverse()
-    return "\n".join(lines)
+        if not msg.content:
+            continue
+        if only_user_and_bot and msg.author.id not in (message.author.id, bot.user.id):
+            continue
+        role = "model" if msg.author.id == bot.user.id else "user"
+        turns.append({"role": role, "parts": [{"text": msg.content}]})
+    turns.reverse()
+    return turns
+
+
+def _merge_consecutive_turns(turns: list[dict]) -> list[dict]:
+    """同じroleが連続するturnを1つにまとめる。
+    (サーバーの複数人の発言をuser roleに寄せる都合上、user turnが連続しうるため、
+    role交互を前提とするマルチターン形式として安全な形に整える)
+    """
+    merged: list[dict] = []
+    for turn in turns:
+        text = turn["parts"][0]["text"]
+        if merged and merged[-1]["role"] == turn["role"]:
+            merged[-1]["parts"][0]["text"] += "\n" + text
+        else:
+            merged.append({"role": turn["role"], "parts": [{"text": text}]})
+    return merged
 
 
 async def _dm_chat_reply(message: discord.Message, content: str) -> str:
@@ -803,7 +847,9 @@ async def _dm_chat_reply(message: discord.Message, content: str) -> str:
     直近の会話履歴(Discord上の実際のやり取り)を踏まえて自然に返す。
     Gemini未設定/失敗時は固定文言にフォールバックする。
     """
-    context_text = await _fetch_recent_context(message, limit=DM_CHAT_CONTEXT_LIMIT)
+    history = _merge_consecutive_turns(
+        await _fetch_recent_turns(message, limit=DM_CHAT_CONTEXT_LIMIT)
+    )
 
     # 今回のメッセージ自体が猫っぽい語尾かどうかで連続回数を更新する。
     # (履歴に残っている過去の猫っぽいやり取りだけを見て判断すると、
@@ -850,11 +896,7 @@ async def _dm_chat_reply(message: discord.Message, content: str) -> str:
         + "説明口調やテンプレっぽい返信は避け、普段の会話のノリで返してください。"
         + "句点なし。長くなりすぎないよう1〜2文程度で。前置きや説明は付けず、返信本文だけを返してください。"
     )
-    if context_text:
-        user_content = f"直近の会話:\n{context_text}\n\n相手の今回の発言: {content}"
-    else:
-        user_content = content
-    reply = await _call_gemini(system_prompt, user_content, max_tokens=120)
+    reply = await _call_gemini(system_prompt, content, max_tokens=120, history=history)
     return reply or DM_CHAT_FALLBACK
 
 
@@ -862,7 +904,9 @@ async def handle_dm_chat(message: discord.Message, content: str) -> None:
     """DMで、既存のどの判定にも当てはまらなかったメッセージへの汎用会話フォールバック。"""
     if not DM_CHAT_ENABLED or not content:
         return
-    reply = await _dm_chat_reply(message, content)
+    # Gemini生成中は「入力中…」を出しておく(履歴取得+生成で数秒かかることがあるため)
+    async with message.channel.typing():
+        reply = await _dm_chat_reply(message, content)
     await message.channel.send(reply)
     # 独自の状態は持たず毎回Discordの実履歴を読むので、ここでは何も登録しない
     # (次のメッセージも自動的にこのhandle_dm_chatに回ってきて、履歴込みで返信される)
@@ -875,7 +919,8 @@ async def handle_mention_chat(message: discord.Message, content: str) -> None:
     if not content:
         # 名前を呼ばれただけ
         if in_chat_channel:
-            reply = await _mention_called_reply(message.author.id)
+            async with message.channel.typing():
+                reply = await _mention_called_reply(message.author.id)
             await message.channel.send(reply)
             _register_mention_followup(
                 message.author.id, message.channel.id, "名前を呼ばれただけ", reply
@@ -891,12 +936,89 @@ async def handle_mention_chat(message: discord.Message, content: str) -> None:
         return
 
     # メンション+内容(1ターン目): 話しかけ内容に反応し、本人からの2ターン目を待つ
-    context_text = None
-    if content.strip() in MENTION_CONTEXT_TRIGGER_PHRASES:
-        context_text = await _fetch_recent_context(message)
-    reply = await _mention_content_reply(message.author.id, content, context_text)
+    use_context = content.strip() in MENTION_CONTEXT_TRIGGER_PHRASES
+    async with message.channel.typing():
+        reply = await _mention_content_reply(message, content, use_context)
     await message.channel.send(reply)
     _register_mention_followup(message.author.id, message.channel.id, content, reply)
+
+
+# ----------------------------------------------------------------------
+# 連続投稿(バースト送信)対応
+# ----------------------------------------------------------------------
+# Discordのユーザーは1つの発言を複数メッセージに分けて連投することが多い。
+# 会話系のハンドラ(メンション会話・DM会話・2ターン目の相槌)を即座に呼ぶ代わりに、
+# 同じユーザー・同じチャンネルからの対象メッセージが一定時間内に続く限りタイマーを延長し、
+# 途切れたところでまとめて1回だけ処理する。
+# 予定登録/キャンセル/一覧表示などのコマンド的な処理は即時性が大事なので対象にしない
+# (on_message側でそれらの判定を先に済ませた後、会話系ハンドラに渡す直前でのみ使う)。
+
+BURST_DEBOUNCE_SECONDS = float(os.environ.get("BURST_DEBOUNCE_SECONDS", "2.0"))
+
+# (user_id, channel_id) -> {"messages": [discord.Message,...], "contents": [str,...],
+#                            "handler": コルーチン関数, "task": asyncio.Task}
+pending_bursts: dict[tuple[int, int], dict] = {}
+
+
+async def _dispatch_burst(key: tuple[int, int], delay: float) -> None:
+    """delay秒待って、その間に新しい対象メッセージが来なければまとめて処理する。
+    待っている間に新しいメッセージが来ると呼び出し側でこのタスクごとキャンセルされるので、
+    ここまで実行が進んだ時点の内容がその時点での「最終形」になる。
+    """
+    try:
+        await asyncio.sleep(delay)
+    except asyncio.CancelledError:
+        return
+
+    entry = pending_bursts.pop(key, None)
+    if entry is None:
+        return
+
+    combined_content = "\n".join(entry["contents"]).strip()
+    last_message = entry["messages"][-1]
+    try:
+        await entry["handler"](last_message, combined_content)
+    except Exception:
+        log.exception("バースト処理後のハンドラ実行に失敗しました")
+
+
+def _queue_burst(message: discord.Message, content: str, handler) -> None:
+    """会話系ハンドラの呼び出しを一定時間デバウンスする。
+    handlerは async def handler(last_message: discord.Message, combined_content: str) の形。
+    同じユーザー・チャンネルから続けて対象メッセージが来た場合は、
+    内容を連結してタイマーをリセットする(handlerは最初の呼び出し時のものを使い続ける)。
+    """
+    key = (message.author.id, message.channel.id)
+    existing = pending_bursts.get(key)
+    if existing is not None:
+        existing["task"].cancel()
+        existing["messages"].append(message)
+        existing["contents"].append(content)
+        entry = existing
+    else:
+        entry = {"messages": [message], "contents": [content], "handler": handler}
+        pending_bursts[key] = entry
+
+    entry["task"] = asyncio.create_task(_dispatch_burst(key, BURST_DEBOUNCE_SECONDS))
+
+
+def _make_followup_handler(followup: dict):
+    """popして消費済みのfollowup情報を保持したまま、バースト経由で遅延実行するハンドラを作る。
+    (2ターンで打ち切る仕組み自体は on_message 側の pop 処理のままで変更しない。
+     ここではあくまで「2ターン目の返信生成・送信」を、連投がまとまるまで遅らせるだけ)
+    """
+
+    async def handler(last_message: discord.Message, combined_content: str) -> None:
+        async with last_message.channel.typing():
+            if followup.get("kind") == "reminder" and _is_recall_query(combined_content):
+                reply = await _reminder_recall_reply(
+                    last_message.author.id, followup["original_text"]
+                )
+            else:
+                reply = await _context_chat_reply(last_message, combined_content)
+        await last_message.channel.send(reply)
+
+    return handler
 
 
 # ----------------------------------------------------------------------
@@ -958,24 +1080,28 @@ async def on_message(message: discord.Message):
         await bot.process_commands(message)
         return
 
+    looks_like_command = _looks_like_bot_command(message.content, datetime.now(JST))
+
+    # 既にバースト(連投待ち)が進行中なら、コマンド的な内容でない限りそこに追記して延長する。
+    # followup(2ターン目)は1通目のpopで消費済みなので、2通目以降はfollowup判定を経由せず
+    # ここで拾わないとまとめられない(pending_mention_followupsには残っていないため)。
+    burst_key = (message.author.id, message.channel.id)
+    if not looks_like_command and burst_key in pending_bursts:
+        entry = pending_bursts[burst_key]
+        entry["task"].cancel()
+        entry["messages"].append(message)
+        entry["contents"].append(message.content)
+        entry["task"] = asyncio.create_task(_dispatch_burst(burst_key, BURST_DEBOUNCE_SECONDS))
+        return
+
     # メンション会話の「2ターン目」判定(再メンション不要、話しかけた本人の発言のみ)。
     # 予定登録/キャンセル/一覧表示コマンドっぽい内容なら、相槌より本来の処理を優先する。
-    if not _looks_like_bot_command(message.content, datetime.now(JST)):
+    if not looks_like_command:
+        # popした時点で「2ターン目を消費した」ことが確定する(2ターン打ち切りの仕組みは維持)。
+        # 実際の返信生成・送信だけは、連投がまとまるまでバースト経由で遅らせる。
         followup = _pop_valid_mention_followup(message.author.id, message.channel.id)
         if followup is not None:
-            if followup.get("kind") == "reminder" and _is_recall_query(message.content):
-                # 「なんのこと？」等 -> リマインドの元の内容を高い原型率で教える
-                reply = await _reminder_recall_reply(
-                    message.author.id, followup["original_text"]
-                )
-            else:
-                reply = await _mention_followup_reply(
-                    message.author.id,
-                    followup["original_text"],
-                    followup["bot_reply"],
-                    message.content,
-                )
-            await message.channel.send(reply)
+            _queue_burst(message, message.content, _make_followup_handler(followup))
             return
 
     # 挨拶メッセージへの返信(GREETING_CHANNEL_IDのチャンネル or DM。メンション不要)。
@@ -988,9 +1114,10 @@ async def on_message(message: discord.Message):
         matched_greeting = _match_greeting(message.content)
         if matched_greeting:
             greeting_text = message.content.strip()
-            reply = await _greeting_reply(
-                message.author.id, greeting_text, matched_greeting
-            )
+            async with message.channel.typing():
+                reply = await _greeting_reply(
+                    message.author.id, greeting_text, matched_greeting
+                )
             await message.channel.send(reply)
             # 挨拶に対して返事した後、本人からの追加メッセージが来たら
             # メンション会話の「2ターン目」と同じ仕組みで続きを返せるようにしておく
@@ -1066,9 +1193,9 @@ async def on_message(message: discord.Message):
     # メンションされていれば会話処理へ。DMならメンション不要で会話フォールバックへ。
     # それ以外(判定チャンネルでの通常チャットなど)は何もしない(邪魔しないため)。
     if mentioned:
-        await handle_mention_chat(message, content)
+        _queue_burst(message, content, handle_mention_chat)
     elif is_dm:
-        await handle_dm_chat(message, content)
+        _queue_burst(message, content, handle_dm_chat)
 
 
 async def cancel_by_reply(message: discord.Message):
