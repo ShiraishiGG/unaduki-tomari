@@ -953,7 +953,7 @@ async def handle_mention_chat(message: discord.Message, content: str) -> None:
 # 予定登録/キャンセル/一覧表示などのコマンド的な処理は即時性が大事なので対象にしない
 # (on_message側でそれらの判定を先に済ませた後、会話系ハンドラに渡す直前でのみ使う)。
 
-BURST_DEBOUNCE_SECONDS = float(os.environ.get("BURST_DEBOUNCE_SECONDS", "2.0"))
+BURST_DEBOUNCE_SECONDS = float(os.environ.get("BURST_DEBOUNCE_SECONDS", "5.0"))
 
 # (user_id, channel_id) -> {"messages": [discord.Message,...], "contents": [str,...],
 #                            "handler": コルーチン関数, "task": asyncio.Task}
