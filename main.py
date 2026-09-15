@@ -1819,8 +1819,34 @@ async def main():
 
     await start_web_server()
 
+    # ログイン(bot.start)がレート制限等で失敗した場合、そのままプロセスを落とすと
+    # Renderがすぐ再起動 → 再ログイン試行 → まだブロック中で失敗、のループになり、
+    # 再ログイン試行自体がグローバルレート制限への負荷になってブロックを長引かせてしまう。
+    # そのため、失敗時はプロセスを落とさず、同じセッションを保持したまま待機してリトライする。
+    backoff_seconds = 30
+    max_backoff_seconds = 600
+
     async with bot:
-        await bot.start(TOKEN)
+        while True:
+            try:
+                await bot.start(TOKEN)
+                return  # 通常はここに来ない(bot.startは接続が切れるまで戻らない)
+            except discord.LoginFailure:
+                # トークン自体が無効なのはリトライしても直らないので終了させる
+                log.exception("Discordへのログインに失敗しました(トークンを確認してください)")
+                raise
+            except discord.HTTPException as e:
+                status = getattr(e, "status", None)
+                log.error(
+                    "Discord接続に失敗しました(status=%s)。%d秒待ってから再試行します。",
+                    status,
+                    backoff_seconds,
+                )
+            except Exception:
+                log.exception("Discord接続中に予期しないエラーが発生しました。再試行します。")
+
+            await asyncio.sleep(backoff_seconds)
+            backoff_seconds = min(backoff_seconds * 2, max_backoff_seconds)
 
 
 if __name__ == "__main__":
