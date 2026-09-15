@@ -12,6 +12,7 @@ import logging
 import os
 import random
 import re
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -533,6 +534,29 @@ def _user_style(user_id: int) -> str:
     return (prefs or {}).get("style", "normal")
 
 
+@asynccontextmanager
+async def _safe_typing(channel):
+    """message.channel.typing()のラッパー。
+    レート制限などでtyping表示の送信自体が失敗しても、その例外でブロック内の
+    本来の処理(Gemini生成・返信送信)が丸ごとスキップされないようにする。
+    (typingはあくまで演出であり、失敗しても会話の成立を妨げてはいけないため)
+    """
+    try:
+        cm = channel.typing()
+        await cm.__aenter__()
+    except Exception:
+        log.warning("typing表示の送信に失敗しました(無視して続行します)")
+        yield
+        return
+    try:
+        yield
+    finally:
+        try:
+            await cm.__aexit__(None, None, None)
+        except Exception:
+            pass
+
+
 async def _call_gemini(
     system_prompt: str,
     user_content: str,
@@ -905,7 +929,7 @@ async def handle_dm_chat(message: discord.Message, content: str) -> None:
     if not DM_CHAT_ENABLED or not content:
         return
     # Gemini生成中は「入力中…」を出しておく(履歴取得+生成で数秒かかることがあるため)
-    async with message.channel.typing():
+    async with _safe_typing(message.channel):
         reply = await _dm_chat_reply(message, content)
     await message.channel.send(reply)
     # 独自の状態は持たず毎回Discordの実履歴を読むので、ここでは何も登録しない
@@ -919,7 +943,7 @@ async def handle_mention_chat(message: discord.Message, content: str) -> None:
     if not content:
         # 名前を呼ばれただけ
         if in_chat_channel:
-            async with message.channel.typing():
+            async with _safe_typing(message.channel):
                 reply = await _mention_called_reply(message.author.id)
             await message.channel.send(reply)
             _register_mention_followup(
@@ -937,7 +961,7 @@ async def handle_mention_chat(message: discord.Message, content: str) -> None:
 
     # メンション+内容(1ターン目): 話しかけ内容に反応し、本人からの2ターン目を待つ
     use_context = content.strip() in MENTION_CONTEXT_TRIGGER_PHRASES
-    async with message.channel.typing():
+    async with _safe_typing(message.channel):
         reply = await _mention_content_reply(message, content, use_context)
     await message.channel.send(reply)
     _register_mention_followup(message.author.id, message.channel.id, content, reply)
@@ -953,7 +977,7 @@ async def handle_mention_chat(message: discord.Message, content: str) -> None:
 # 予定登録/キャンセル/一覧表示などのコマンド的な処理は即時性が大事なので対象にしない
 # (on_message側でそれらの判定を先に済ませた後、会話系ハンドラに渡す直前でのみ使う)。
 
-BURST_DEBOUNCE_SECONDS = float(os.environ.get("BURST_DEBOUNCE_SECONDS", "5.0"))
+BURST_DEBOUNCE_SECONDS = float(os.environ.get("BURST_DEBOUNCE_SECONDS", "2.0"))
 
 # (user_id, channel_id) -> {"messages": [discord.Message,...], "contents": [str,...],
 #                            "handler": コルーチン関数, "task": asyncio.Task}
@@ -1009,7 +1033,7 @@ def _make_followup_handler(followup: dict):
     """
 
     async def handler(last_message: discord.Message, combined_content: str) -> None:
-        async with last_message.channel.typing():
+        async with _safe_typing(last_message.channel):
             if followup.get("kind") == "reminder" and _is_recall_query(combined_content):
                 reply = await _reminder_recall_reply(
                     last_message.author.id, followup["original_text"]
@@ -1114,7 +1138,7 @@ async def on_message(message: discord.Message):
         matched_greeting = _match_greeting(message.content)
         if matched_greeting:
             greeting_text = message.content.strip()
-            async with message.channel.typing():
+            async with _safe_typing(message.channel):
                 reply = await _greeting_reply(
                     message.author.id, greeting_text, matched_greeting
                 )
