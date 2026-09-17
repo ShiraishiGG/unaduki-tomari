@@ -21,6 +21,9 @@ import aiohttp
 from aiohttp import web
 from discord.ext import commands, tasks
 
+import gspread
+from google.oauth2.service_account import Credentials
+
 import web_push
 
 # ----------------------------------------------------------------------
@@ -34,6 +37,17 @@ TOKEN = os.environ.get("DISCORD_TOKEN")
 PORT = int(os.environ.get("PORT", "8080"))
 DATA_FILE = os.environ.get("REMINDERS_FILE", "reminders.json")
 COMMAND_PREFIX = os.environ.get("COMMAND_PREFIX", "!")
+
+# Googleスプレッドシートへの自動バックアップ設定。
+# GOOGLE_SHEET_ID: バックアップ先スプレッドシートのID(URLの/d/と/editの間の文字列)
+# GOOGLE_SERVICE_ACCOUNT_JSON: サービスアカウントの認証情報(JSONファイルの中身をそのまま1行で)
+# どちらか未設定の場合は自動バックアップ・自動復元とも無効(従来のtxt手動!backup/!restoreのみ)。
+GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+
+# 短時間に連続でリマインドや設定が変化しても、実際のスプレッドシート書き込みは
+# この秒数だけ待ってまとめて1回にする(連投登録での書き込み過多・APIレート制限を防ぐため)。
+BACKUP_DEBOUNCE_SECONDS = float(os.environ.get("BACKUP_DEBOUNCE_SECONDS", "120"))
 
 # 通知(リマインド送信)を固定で行うチャンネルID。
 # 未設定の場合は従来通り「登録したチャンネル」に通知する。
@@ -135,6 +149,7 @@ def load_user_prefs():
 def save_user_prefs():
     with open(USER_PREFS_FILE, "w", encoding="utf-8") as f:
         json.dump(user_prefs, f, ensure_ascii=False, indent=2)
+    _schedule_sheet_backup()
 
 
 user_prefs = load_user_prefs()
@@ -1064,8 +1079,13 @@ def load_reminders():
 def save_reminders(reminders):
     with open(DATA_FILE, "w", encoding="utf-8") as f:
         json.dump(reminders, f, ensure_ascii=False, indent=2)
+    _schedule_sheet_backup()
 
 
+# ディスクがリセットされた場合、reminders.jsonは(中身が空なのではなく)
+# ファイルごと存在しなくなる。「起動時に存在したか」を別途覚えておくことで、
+# 「予定が0件」なのが正常な状態なのか、データが消えた結果なのかを区別する。
+_reminders_file_existed = os.path.exists(DATA_FILE)
 reminders = load_reminders()
 _next_id = (max((r["id"] for r in reminders), default=0)) + 1
 
@@ -1075,6 +1095,244 @@ def next_id():
     value = _next_id
     _next_id += 1
     return value
+
+
+# ----------------------------------------------------------------------
+# Googleスプレッドシートへの自動バックアップ/自動復元
+# ----------------------------------------------------------------------
+# gspreadは同期(ブロッキング)ライブラリなので、asyncio.to_threadで別スレッド実行し、
+# イベントループを止めないようにする。
+# シートは3タブ構成: Reminders / UserPrefs / PushSubs。
+# 書き込みはいずれも「毎回全件クリアして書き直す」方式にして、差分計算の複雑さを避ける
+# (件数がこの規模のBotなら全件書き直しでも軽量)。
+
+REMINDERS_SHEET_HEADER = [
+    "id", "remind_at", "user_id", "channel_id", "guild_id", "message_id", "message"
+]
+USERPREFS_SHEET_HEADER = ["user_id", "style", "nickname"]
+PUSHSUBS_SHEET_HEADER = ["user_id", "subscription_json"]
+
+_gspread_client = None
+
+
+def _get_gspread_client():
+    """未設定なら None を返す(呼び出し側は何もしない)。"""
+    global _gspread_client
+    if _gspread_client is not None:
+        return _gspread_client
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        return None
+    try:
+        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        creds = Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+        _gspread_client = gspread.authorize(creds)
+    except Exception:
+        log.exception("Googleサービスアカウントの認証に失敗しました")
+        return None
+    return _gspread_client
+
+
+def _get_backup_spreadsheet():
+    if not GOOGLE_SHEET_ID:
+        return None
+    client = _get_gspread_client()
+    if client is None:
+        return None
+    try:
+        return client.open_by_key(GOOGLE_SHEET_ID)
+    except Exception:
+        log.exception("Googleスプレッドシートを開けませんでした(GOOGLE_SHEET_IDや共有設定を確認)")
+        return None
+
+
+def _get_or_create_worksheet(spreadsheet, title: str, header: list[str]):
+    try:
+        ws = spreadsheet.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=title, rows=200, cols=len(header) + 2)
+        ws.append_row(header)
+    return ws
+
+
+def _write_sheet_backup_sync() -> None:
+    """同期関数本体。呼び出し側(_write_sheet_backup)でto_threadに包むこと。"""
+    spreadsheet = _get_backup_spreadsheet()
+    if spreadsheet is None:
+        return
+
+    reminders_ws = _get_or_create_worksheet(spreadsheet, "Reminders", REMINDERS_SHEET_HEADER)
+    reminders_ws.clear()
+    reminders_ws.append_row(REMINDERS_SHEET_HEADER)
+    rows = [
+        [
+            r["id"], r["remind_at"], r["user_id"], r["channel_id"],
+            r.get("guild_id"), r.get("message_id"), r["message"],
+        ]
+        for r in sorted(reminders, key=lambda r: r["remind_at"])
+    ]
+    if rows:
+        reminders_ws.append_rows(rows, value_input_option="RAW")
+
+    prefs_ws = _get_or_create_worksheet(spreadsheet, "UserPrefs", USERPREFS_SHEET_HEADER)
+    prefs_ws.clear()
+    prefs_ws.append_row(USERPREFS_SHEET_HEADER)
+    prefs_rows = [
+        [uid, pref.get("style", "normal"), pref.get("nickname", "")]
+        for uid, pref in sorted(user_prefs.items())
+        if pref.get("nickname")
+    ]
+    if prefs_rows:
+        prefs_ws.append_rows(prefs_rows, value_input_option="RAW")
+
+    push_ws = _get_or_create_worksheet(spreadsheet, "PushSubs", PUSHSUBS_SHEET_HEADER)
+    push_ws.clear()
+    push_ws.append_row(PUSHSUBS_SHEET_HEADER)
+    push_rows = [
+        [uid, json.dumps(sub, ensure_ascii=False)]
+        for uid, subs in sorted(web_push.get_all_subscriptions().items())
+        for sub in subs
+    ]
+    if push_rows:
+        push_ws.append_rows(push_rows, value_input_option="RAW")
+
+
+async def _write_sheet_backup() -> None:
+    try:
+        await asyncio.to_thread(_write_sheet_backup_sync)
+    except Exception:
+        log.exception("Googleスプレッドシートへのバックアップ書き込みに失敗しました")
+
+
+def _read_sheet_backup_sync() -> tuple[list[dict], dict, dict] | None:
+    """同期関数本体。呼び出し側(_read_sheet_backup)でto_threadに包むこと。
+    見つからない/未設定ならNone。
+    """
+    spreadsheet = _get_backup_spreadsheet()
+    if spreadsheet is None:
+        return None
+
+    try:
+        reminders_ws = spreadsheet.worksheet("Reminders")
+        prefs_ws = spreadsheet.worksheet("UserPrefs")
+        push_ws = spreadsheet.worksheet("PushSubs")
+    except gspread.exceptions.WorksheetNotFound:
+        return None
+
+    restored_reminders = []
+    for row in reminders_ws.get_all_records():
+        try:
+            guild_s = str(row.get("guild_id", "")).strip()
+            msgid_s = str(row.get("message_id", "")).strip()
+            restored_reminders.append({
+                "id": int(row["id"]),
+                "remind_at": str(row["remind_at"]),
+                "user_id": int(row["user_id"]),
+                "channel_id": int(row["channel_id"]),
+                "guild_id": int(guild_s) if guild_s else None,
+                "message_id": int(msgid_s) if msgid_s else None,
+                "message": str(row["message"]),
+                "created_at": datetime.now(JST).isoformat(),
+            })
+        except (KeyError, ValueError):
+            continue
+
+    restored_prefs = {}
+    for row in prefs_ws.get_all_records():
+        uid = str(row.get("user_id", "")).strip()
+        nickname = str(row.get("nickname", "")).strip()
+        if uid and nickname:
+            restored_prefs[uid] = {
+                "style": row.get("style") or "normal",
+                "nickname": nickname,
+            }
+
+    restored_push: dict[str, list] = {}
+    for row in push_ws.get_all_records():
+        uid = str(row.get("user_id", "")).strip()
+        sub_json = row.get("subscription_json", "")
+        if not uid or not sub_json:
+            continue
+        try:
+            sub_obj = json.loads(sub_json)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        restored_push.setdefault(uid, []).append(sub_obj)
+
+    return restored_reminders, restored_prefs, restored_push
+
+
+async def _read_sheet_backup() -> tuple[list[dict], dict, dict] | None:
+    try:
+        return await asyncio.to_thread(_read_sheet_backup_sync)
+    except Exception:
+        log.exception("Googleスプレッドシートからの読み込みに失敗しました")
+        return None
+
+
+_sheet_backup_task: asyncio.Task | None = None
+
+
+def _schedule_sheet_backup() -> None:
+    """save_reminders/save_user_prefsが呼ばれるたびに呼ぶ。
+    短時間に何度も呼ばれても、実際の書き込みはBACKUP_DEBOUNCE_SECONDS
+    (既定2分)待ってまとめて1回にする(連投登録・APIレート制限対策)。
+    """
+    global _sheet_backup_task
+    if not (GOOGLE_SHEET_ID and GOOGLE_SERVICE_ACCOUNT_JSON):
+        return
+    if _sheet_backup_task is not None and not _sheet_backup_task.done():
+        _sheet_backup_task.cancel()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # 起動処理中などイベントループが無い状態から呼ばれた場合は何もしない
+        return
+    _sheet_backup_task = loop.create_task(_run_sheet_backup())
+
+
+async def _run_sheet_backup() -> None:
+    try:
+        await asyncio.sleep(BACKUP_DEBOUNCE_SECONDS)
+    except asyncio.CancelledError:
+        return
+    await _write_sheet_backup()
+
+
+async def _try_auto_restore_from_sheet() -> None:
+    """reminders.jsonが起動時点でそもそも存在しなかった(ディスクがリセットされた
+    可能性が高い)場合、Googleスプレッドシートの内容から自己修復を試みる。
+    """
+    global reminders, _next_id
+    if not (GOOGLE_SHEET_ID and GOOGLE_SERVICE_ACCOUNT_JSON):
+        return
+
+    result = await _read_sheet_backup()
+    if result is None:
+        log.info("自動復元: スプレッドシートが見つからない/未設定のためスキップします")
+        return
+
+    restored_reminders, restored_prefs, restored_push = result
+    if not restored_reminders and not restored_prefs and not restored_push:
+        log.info("自動復元: スプレッドシートに復元できるデータがありませんでした")
+        return
+
+    reminders = restored_reminders
+    _next_id = (max((r["id"] for r in reminders), default=0)) + 1
+    user_prefs.update(restored_prefs)
+    for uid_s, subs in restored_push.items():
+        for sub in subs:
+            web_push.import_subscription(int(uid_s), sub)
+
+    save_reminders(reminders)
+    save_user_prefs()
+    log.info(
+        "自動復元: スプレッドシートから予定%d件・設定%d件・通知購読%d件を復元しました",
+        len(restored_reminders),
+        len(restored_prefs),
+        sum(len(v) for v in restored_push.values()),
+    )
 
 
 # ----------------------------------------------------------------------
@@ -1092,6 +1350,8 @@ async def on_ready():
     log.info("ログイン完了: %s", bot.user)
     if not reminder_loop.is_running():
         reminder_loop.start()
+    if not _reminders_file_existed:
+        await _try_auto_restore_from_sheet()
 
 
 @bot.event
