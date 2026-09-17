@@ -1,8 +1,6 @@
 """
-Discord カレンダー(リマインド)Bot
-- 「9/7 10:00 買い物にいく」のようなメッセージを送ると
-  指定日時になったら送信者にメンションしてメッセージを通知する。
-- Render にデプロイするための簡易HTTPサーバー(PORT)を同時に起動する。
+Discordで宇奈月とまりは生きている
+
 """
 
 import asyncio
@@ -1167,8 +1165,10 @@ def _write_sheet_backup_sync() -> None:
     reminders_ws.append_row(REMINDERS_SHEET_HEADER)
     rows = [
         [
-            r["id"], r["remind_at"], r["user_id"], r["channel_id"],
-            r.get("guild_id"), r.get("message_id"), r["message"],
+            str(r["id"]), r["remind_at"], str(r["user_id"]), str(r["channel_id"]),
+            str(r["guild_id"]) if r.get("guild_id") is not None else "",
+            str(r["message_id"]) if r.get("message_id") is not None else "",
+            r["message"],
         ]
         for r in sorted(reminders, key=lambda r: r["remind_at"])
     ]
@@ -1856,6 +1856,27 @@ async def _resolve_recent_txt_attachment(ctx: commands.Context) -> discord.Attac
 
     await ctx.reply("もう候補が無いや、送ってくれる？")
     return None
+
+
+@bot.command(name="sheetsync")
+async def sheet_sync(ctx: commands.Context):
+    """デバウンスを待たずに、今のリマインド/設定/通知購読をGoogleスプレッドシートへ即時書き込みする。
+    悪用防止のため、ADMIN_USER_IDS に登録された管理者のみ実行できる。
+    """
+    if not is_admin(ctx.author.id):
+        await ctx.reply("権利ナシ！")
+        return
+    if not (GOOGLE_SHEET_ID and GOOGLE_SERVICE_ACCOUNT_JSON):
+        await ctx.reply("スプレッドシート連携が設定されてないよ")
+        return
+
+    global _sheet_backup_task
+    if _sheet_backup_task is not None and not _sheet_backup_task.done():
+        _sheet_backup_task.cancel()
+
+    await ctx.reply("書き込み中…")
+    await _write_sheet_backup()
+    await ctx.reply("スプレッドシートに書き込んだよ")
 
 
 @bot.command(name="backup")
