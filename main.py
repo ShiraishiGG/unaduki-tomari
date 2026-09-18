@@ -4,6 +4,8 @@ Discordで宇奈月とまりは生きている
 """
 
 import asyncio
+import base64
+import calendar
 import io
 import json
 import logging
@@ -79,6 +81,18 @@ CANCEL_BY_ID_RE = re.compile(
     r"^(\d+)\s*(?:" + "|".join(re.escape(kw) for kw in CANCEL_KEYWORDS) + r")$"
 )
 
+# 繰り返しリマインドの「次回分だけスキップ」用キーワード(シリーズ自体は解除しない)。
+# CANCEL_KEYWORDSでリプライ/ID指定した場合はシリーズごと解除、こちらは次回だけ。
+# 繰り返しでない(単発の)リマインドに対して使った場合は、次が無いのでシリーズ解除と同じ扱いになる。
+SKIP_NEXT_KEYWORDS = [
+    kw.strip()
+    for kw in os.environ.get("SKIP_NEXT_KEYWORDS", "次だけなし,今回だけなし,今回はスキップ").split(",")
+    if kw.strip()
+]
+SKIP_NEXT_BY_ID_RE = re.compile(
+    r"^(\d+)\s*(?:" + "|".join(re.escape(kw) for kw in SKIP_NEXT_KEYWORDS) + r")$"
+)
+
 
 # このメッセージを送ると予約中リマインド一覧を表示する(カンマ区切りで複数指定可能)
 LIST_KEYWORDS = [
@@ -86,6 +100,10 @@ LIST_KEYWORDS = [
     for kw in os.environ.get("LIST_KEYWORDS", "今の予定,予定確認,予定一覧").split(",")
     if kw.strip()
 ]
+
+# 完了確認: リマインド送信後、この分数だけ経っても本人(登録チャンネルでの発言に限る)から
+# 何のメッセージも無ければ、1回だけ「わすれてない？」的な確認を送る。
+COMPLETION_CHECK_DELAY_MINUTES = int(os.environ.get("COMPLETION_CHECK_DELAY_MINUTES", "5"))
 
 # 「!backup」「!restore」を実行できる管理者のDiscordユーザーID(カンマ区切り)。
 # restoreは外部から偽のリマインドを注入できてしまうため、実行できる人を限定する。
@@ -461,6 +479,113 @@ def parse_reminder(content: str, now: datetime):
     return None
 
 
+WEEKDAY_NAME_TO_INDEX = {"月": 0, "火": 1, "水": 2, "木": 3, "金": 4, "土": 5, "日": 6}
+
+
+def _parse_time_token(token: str) -> tuple[int, int] | None:
+    """"21時" "21時30分" "21:30" のような時刻トークンを (hour, minute) にする。"""
+    m = re.match(r"^(\d{1,2})時(?:(\d{1,2})分)?$", token)
+    if m:
+        return int(m.group(1)), int(m.group(2) or 0)
+    m = re.match(r"^(\d{1,2}):(\d{2})$", token)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+
+# 繰り返しリマインドの登録パターン:
+#   毎日21時 ご飯 / 毎日21:00 ご飯
+#   毎週月曜10時 ゴミ出し / 毎週月10:00 ゴミ出し
+#   毎月1日9時 家賃 / 毎月1日9:00 家賃
+REPEAT_DAILY_RE = re.compile(r"^毎日\s*(\S+?)(?:\s+(\S.*))?$")
+REPEAT_WEEKLY_RE = re.compile(r"^毎週(月|火|水|木|金|土|日)(?:曜日?)?\s*(\S+?)(?:\s+(\S.*))?$")
+REPEAT_MONTHLY_RE = re.compile(r"^毎月(\d{1,2})日\s*(\S+?)(?:\s+(\S.*))?$")
+
+
+def parse_repeat_reminder(content: str, now: datetime):
+    """繰り返しリマインドの登録メッセージを解析する。
+    戻り値: (初回のremind_at, メッセージ本文, repeat種別("daily"/"weekly"/"monthly")) または None。
+    """
+    content = content.strip()
+    if not content:
+        return None
+
+    m = REPEAT_DAILY_RE.match(content)
+    if m:
+        time_token, text = m.groups()
+        parsed_time = _parse_time_token(time_token)
+        if parsed_time is None:
+            return None
+        hour, minute = parsed_time
+        try:
+            dt = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(
+                hours=hour, minutes=minute
+            )
+        except ValueError:
+            return None
+        if dt <= now:
+            dt += timedelta(days=1)
+        return dt, (text or "").strip(), "daily"
+
+    m = REPEAT_WEEKLY_RE.match(content)
+    if m:
+        weekday_kanji, time_token, text = m.groups()
+        parsed_time = _parse_time_token(time_token)
+        if parsed_time is None:
+            return None
+        hour, minute = parsed_time
+        target_weekday = WEEKDAY_NAME_TO_INDEX[weekday_kanji]
+        base_date = now.date()
+        days_ahead = (target_weekday - base_date.weekday()) % 7
+        try:
+            dt = datetime(
+                base_date.year, base_date.month, base_date.day, tzinfo=JST
+            ) + timedelta(days=days_ahead, hours=hour, minutes=minute)
+        except ValueError:
+            return None
+        if dt <= now:
+            dt += timedelta(days=7)
+        return dt, (text or "").strip(), "weekly"
+
+    m = REPEAT_MONTHLY_RE.match(content)
+    if m:
+        day_s, time_token, text = m.groups()
+        parsed_time = _parse_time_token(time_token)
+        if parsed_time is None:
+            return None
+        hour, minute = parsed_time
+        day = int(day_s)
+        year, month = now.year, now.month
+        try:
+            last_day = calendar.monthrange(year, month)[1]
+            dt = datetime(
+                year, month, min(day, last_day), tzinfo=JST
+            ) + timedelta(hours=hour, minutes=minute)
+        except ValueError:
+            return None
+        if dt <= now:
+            dt = _next_occurrence(dt, "monthly")
+        return dt, (text or "").strip(), "monthly"
+
+    return None
+
+
+def _next_occurrence(remind_at: datetime, repeat: str) -> datetime:
+    """繰り返しリマインドが1回発火した後の、次回のremind_atを計算する。"""
+    if repeat == "daily":
+        return remind_at + timedelta(days=1)
+    if repeat == "weekly":
+        return remind_at + timedelta(weeks=1)
+    if repeat == "monthly":
+        year, month = remind_at.year, remind_at.month + 1
+        if month > 12:
+            month = 1
+            year += 1
+        last_day = calendar.monthrange(year, month)[1]
+        day = min(remind_at.day, last_day)
+        return remind_at.replace(year=year, month=month, day=day)
+    return remind_at  # 通常呼ばれない
+
 # ----------------------------------------------------------------------
 # メンション会話 (名前を呼ばれた反応 / 話しかけへの反応 / 2ターン目の相槌)
 # ----------------------------------------------------------------------
@@ -543,6 +668,48 @@ def _is_recall_query(content: str) -> bool:
 # 1人が複数件のリマインドを同時に抱えられるよう、単一dictではなくリストで保持する。
 pending_mention_followups: dict[str, list[dict]] = {}
 
+# 完了確認用の一時状態(永続化しない、再起動で消えてOK)。
+# user_id -> [{"channel_id":.., "message":.., "check_at": isoformat}, ...]
+pending_completion_checks: dict[int, list[dict]] = {}
+
+
+def _mark_completion_response(user_id: int, channel_id: int) -> None:
+    """完了確認の監視対象チャンネルで本人が何か発言したら「反応あり」として消す。
+    メンションの有無や内容は問わない。on_messageの冒頭から呼び、通常の処理は妨げない。
+    """
+    entries = pending_completion_checks.get(user_id)
+    if not entries:
+        return
+    remaining = [e for e in entries if e["channel_id"] != channel_id]
+    if remaining:
+        pending_completion_checks[user_id] = remaining
+    else:
+        pending_completion_checks.pop(user_id, None)
+
+
+async def _check_completion_reminders(now: datetime) -> None:
+    """締切(COMPLETION_CHECK_DELAY_MINUTES経過)を過ぎても反応が無いエントリに、
+    1回だけ「わすれてない？」的な確認を送る。送ったらそのエントリの追跡は終了する。
+    """
+    for user_id, entries in list(pending_completion_checks.items()):
+        remaining = []
+        for entry in entries:
+            if now < datetime.fromisoformat(entry["check_at"]):
+                remaining.append(entry)
+                continue
+            try:
+                channel = bot.get_channel(entry["channel_id"]) or await bot.fetch_channel(
+                    entry["channel_id"]
+                )
+                await channel.send(f"<@{user_id}> 「{entry['message']}」、やった？わすれてない？")
+            except Exception:
+                log.exception("完了確認メッセージの送信に失敗しました")
+            # 確認は1回までなので、送信の成否に関わらずここで追跡を終える
+        if remaining:
+            pending_completion_checks[user_id] = remaining
+        else:
+            pending_completion_checks.pop(user_id, None)
+
 def _user_style(user_id: int) -> str:
     prefs = user_prefs.get(str(user_id))
     return (prefs or {}).get("style", "normal")
@@ -611,6 +778,183 @@ async def _call_gemini(
     except Exception:
         log.exception("Gemini API 呼び出し中にエラーが発生しました")
         return None
+
+
+async def _call_gemini_vision(
+    system_prompt: str, image_bytes: bytes, mime_type: str, extra_text: str = ""
+) -> str | None:
+    """画像を1枚渡してGeminiに解析させる(画像からのリマインド登録用)。
+    _call_geminiと違い、画像(inline_data)をpartsに含める。未設定/失敗時はNone。
+    """
+    if not GEMINI_API_KEY:
+        return None
+
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    )
+    parts = [
+        {
+            "inline_data": {
+                "mime_type": mime_type,
+                "data": base64.b64encode(image_bytes).decode("ascii"),
+            }
+        }
+    ]
+    if extra_text:
+        parts.append({"text": extra_text})
+    payload = {
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": parts}],
+        # 日時抽出はJSONで正確に返してほしいので、会話系より温度は低め・トークンは多めにする
+        "generationConfig": {"maxOutputTokens": 200, "temperature": 0.2},
+    }
+    try:
+        timeout = aiohttp.ClientTimeout(total=GEMINI_TIMEOUT_SECONDS)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=payload) as resp:
+                if resp.status != 200:
+                    log.warning("Gemini API(画像) 呼び出し失敗 (status=%s)", resp.status)
+                    return None
+                data = await resp.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        return text or None
+    except Exception:
+        log.exception("Gemini API(画像) 呼び出し中にエラーが発生しました")
+        return None
+
+
+# ----------------------------------------------------------------------
+# 画像からのリマインド登録
+# ----------------------------------------------------------------------
+# 画像(チラシ等)が添付されたメッセージから、Geminiのマルチモーダルで日時と内容を抽出し、
+# 「10/1の21時に登録しておく？」のようにリアクションで確認してから登録する。
+# 確認待ちの状態は永続化しない(再起動で消えてOK。confirm用メッセージID -> 情報)。
+
+IMAGE_REMINDER_ENABLED = os.environ.get("IMAGE_REMINDER_ENABLED", "1") not in ("0", "false", "False")
+IMAGE_CONFIRM_EMOJI = os.environ.get("IMAGE_CONFIRM_EMOJI", "✅")
+IMAGE_DENY_EMOJI = os.environ.get("IMAGE_DENY_EMOJI", "❌")
+IMAGE_REMINDER_TIMEOUT_MINUTES = int(os.environ.get("IMAGE_REMINDER_TIMEOUT_MINUTES", "30"))
+
+IMAGE_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+# message_id(Botが送った確認メッセージ) -> {"user_id","channel_id","remind_at","text","expires_at"}
+pending_image_registrations: dict[int, dict] = {}
+
+
+def _is_image_attachment(att: discord.Attachment) -> bool:
+    if att.content_type and att.content_type.startswith("image/"):
+        return True
+    return att.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif"))
+
+
+async def _extract_reminder_from_image(
+    image_bytes: bytes, mime_type: str, caption: str, now: datetime
+) -> dict | None:
+    """画像から日時とイベント内容を抽出する。読み取れなければNone。
+    戻り値: {"month","day","hour","minute","text"}(いずれも読み取れた値)
+    """
+    system_prompt = (
+        "あなたは画像(チラシ・告知・スクリーンショット等)から予定を抽出するアシスタントです。"
+        f"今日の日付は{now.strftime('%Y年%m月%d日')}です。"
+        "画像の中に日付・時刻・イベント内容が読み取れる場合、必ず次のJSON形式のみで答えてください"
+        "(説明文やコードブロックの記号は付けないこと): "
+        '{"found": true, "month": 10, "day": 1, "hour": 21, "minute": 0, "text": "イベント名"}'
+        "。時刻が読み取れない場合はhour/minuteを省略してください。"
+        "日時が全く読み取れない画像の場合は{\"found\": false}とだけ返してください。"
+    )
+    extra_text = f"補足(添えられていたメッセージ): {caption}" if caption else ""
+    raw = await _call_gemini_vision(system_prompt, image_bytes, mime_type, extra_text)
+    if not raw:
+        return None
+
+    m = IMAGE_JSON_RE.search(raw)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(0))
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+    if not data.get("found"):
+        return None
+    try:
+        month = int(data["month"])
+        day = int(data["day"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    hour = data.get("hour")
+    minute = data.get("minute")
+    try:
+        hour = int(hour) if hour is not None else 9
+        minute = int(minute) if minute is not None else 0
+    except (TypeError, ValueError):
+        hour, minute = 9, 0
+
+    text = str(data.get("text") or "").strip()
+    if not text:
+        return None
+
+    return {"month": month, "day": day, "hour": hour, "minute": minute, "text": text}
+
+
+async def handle_image_reminder_registration(message: discord.Message, caption: str) -> None:
+    """画像添付メッセージから日時・内容を抽出し、リアクションでの確認を挟んで登録する。"""
+    attachment = next((a for a in message.attachments if _is_image_attachment(a)), None)
+    if attachment is None:
+        return
+
+    now = datetime.now(JST)
+    try:
+        image_bytes = await attachment.read()
+    except Exception:
+        log.exception("画像の読み込みに失敗しました")
+        return
+
+    async with _safe_typing(message.channel):
+        extracted = await _extract_reminder_from_image(
+            image_bytes, attachment.content_type or "image/png", caption, now
+        )
+
+    if extracted is None:
+        await message.reply("日時が読み取れなかった…")
+        return
+
+    try:
+        dt = datetime(
+            now.year, extracted["month"], extracted["day"], tzinfo=JST
+        ) + timedelta(hours=extracted["hour"], minutes=extracted["minute"])
+    except ValueError:
+        await message.reply("日時が読み取れなかった…")
+        return
+    if dt <= now:
+        try:
+            dt = dt.replace(year=now.year + 1)
+        except ValueError:
+            await message.reply("日時が読み取れなかった…")
+            return
+
+    confirm_text = (
+        f"{dt.strftime('%m/%d')}の{dt.strftime('%H:%M')}に"
+        f"「{extracted['text']}」で登録しておく？"
+    )
+    sent = await message.reply(confirm_text)
+
+    try:
+        await sent.add_reaction(IMAGE_CONFIRM_EMOJI)
+        await sent.add_reaction(IMAGE_DENY_EMOJI)
+    except Exception:
+        log.exception("確認用リアクションの付与に失敗しました")
+
+    pending_image_registrations[sent.id] = {
+        "user_id": message.author.id,
+        "channel_id": message.channel.id,
+        "guild_id": message.guild.id if message.guild else None,
+        "remind_at": dt.isoformat(),
+        "text": extracted["text"],
+        "expires_at": (now + timedelta(minutes=IMAGE_REMINDER_TIMEOUT_MINUTES)).isoformat(),
+    }
 
 
 async def _mention_called_reply(user_id: int) -> str:
@@ -826,11 +1170,13 @@ def _looks_like_bot_command(content: str, now: datetime) -> bool:
     content = content.strip()
     if not content:
         return False
-    if content in CANCEL_KEYWORDS or content in LIST_KEYWORDS:
+    if content in CANCEL_KEYWORDS or content in LIST_KEYWORDS or content in SKIP_NEXT_KEYWORDS:
         return True
-    if CANCEL_BY_ID_RE.match(content):
+    if CANCEL_BY_ID_RE.match(content) or SKIP_NEXT_BY_ID_RE.match(content):
         return True
     if parse_reminder(content, now) is not None:
+        return True
+    if parse_repeat_reminder(content, now) is not None:
         return True
     return False
 
@@ -1106,7 +1452,7 @@ def next_id():
 # (件数がこの規模のBotなら全件書き直しでも軽量)。
 
 REMINDERS_SHEET_HEADER = [
-    "id", "remind_at", "user_id", "channel_id", "guild_id", "message_id", "message"
+    "id", "remind_at", "user_id", "channel_id", "guild_id", "message_id", "repeat", "message"
 ]
 USERPREFS_SHEET_HEADER = ["user_id", "style", "nickname"]
 PUSHSUBS_SHEET_HEADER = ["user_id", "subscription_json"]
@@ -1169,6 +1515,7 @@ def _write_sheet_backup_sync() -> None:
             str(r["id"]), r["remind_at"], str(r["user_id"]), str(r["channel_id"]),
             str(r["guild_id"]) if r.get("guild_id") is not None else "",
             str(r["message_id"]) if r.get("message_id") is not None else "",
+            r.get("repeat") or "",
             r["message"],
         ]
         for r in sorted(reminders, key=lambda r: r["remind_at"])
@@ -1226,6 +1573,7 @@ def _read_sheet_backup_sync() -> tuple[list[dict], dict, dict] | None:
         try:
             guild_s = str(row.get("guild_id", "")).strip()
             msgid_s = str(row.get("message_id", "")).strip()
+            repeat_s = str(row.get("repeat", "")).strip()
             restored_reminders.append({
                 "id": int(row["id"]),
                 "remind_at": str(row["remind_at"]),
@@ -1233,6 +1581,7 @@ def _read_sheet_backup_sync() -> tuple[list[dict], dict, dict] | None:
                 "channel_id": int(row["channel_id"]),
                 "guild_id": int(guild_s) if guild_s else None,
                 "message_id": int(msgid_s) if msgid_s else None,
+                "repeat": repeat_s if repeat_s in ("daily", "weekly", "monthly") else None,
                 "message": str(row["message"]),
                 "created_at": datetime.now(JST).isoformat(),
             })
@@ -1356,9 +1705,61 @@ async def on_ready():
 
 
 @bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    """画像からのリマインド登録の確認(✅/❌)を拾う。"""
+    if payload.user_id == bot.user.id:
+        return
+    entry = pending_image_registrations.get(payload.message_id)
+    if entry is None:
+        return
+    if payload.user_id != entry["user_id"]:
+        return  # 登録した本人以外のリアクションは無視
+
+    emoji = str(payload.emoji)
+    if emoji not in (IMAGE_CONFIRM_EMOJI, IMAGE_DENY_EMOJI):
+        return
+
+    del pending_image_registrations[payload.message_id]
+
+    channel = bot.get_channel(entry["channel_id"]) or await bot.fetch_channel(entry["channel_id"])
+    now = datetime.now(JST)
+    if now > datetime.fromisoformat(entry["expires_at"]):
+        await channel.send("確認の期限切れたから、もう一回送って")
+        return
+
+    if emoji == IMAGE_DENY_EMOJI:
+        await channel.send("やめておくね")
+        return
+
+    reminder = {
+        "id": next_id(),
+        "user_id": entry["user_id"],
+        "channel_id": entry["channel_id"],
+        "guild_id": entry["guild_id"],
+        "remind_at": entry["remind_at"],
+        "message": entry["text"],
+        "created_at": now.isoformat(),
+        "message_id": payload.message_id,  # この確認メッセージへのリプライでキャンセルできるように
+        "repeat": None,
+    }
+    reminders.append(reminder)
+    save_reminders(reminders)
+
+    if CONFIRM_EMOJI:
+        try:
+            await channel.send(CONFIRM_EMOJI)
+        except Exception:
+            log.exception("完了リアクションの送信に失敗しました")
+
+
+@bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
+
+    # 完了確認: リマインドを送った本人がここで何か発言した、という事実だけを記録する。
+    # コマンドかどうか・メンションの有無は問わず、通常の処理はそのまま続行する(横取りしない)。
+    _mark_completion_response(message.author.id, message.channel.id)
 
     # コマンド ("!reminders" など) はコマンド処理に回す
     if message.content.startswith(COMMAND_PREFIX):
@@ -1432,9 +1833,21 @@ async def on_message(message: discord.Message):
         )
         content = re.sub(r"\s+", " ", content).strip()
 
-    # 予約メッセージ or Botの確認メッセージへの「やっぱなし」リプライでキャンセル
+    # 画像が添付されていれば、画像からのリマインド登録を試みる(登録チャンネルのみ)。
+    # テキストの解析より先に判定する(画像+キャプションの組み合わせを横取りしないため)。
+    if IMAGE_REMINDER_ENABLED and is_register_channel and message.attachments:
+        if any(_is_image_attachment(a) for a in message.attachments):
+            await handle_image_reminder_registration(message, content)
+            return
+
+    # 予約メッセージ or Botの確認メッセージへの「やっぱなし」リプライでキャンセル(シリーズごと解除)
     if message.reference is not None and content in CANCEL_KEYWORDS:
         await cancel_by_reply(message)
+        return
+
+    # 予約メッセージへの「次だけなし」リプライで、次回分だけスキップ(繰り返しでなければ全解除と同じ)
+    if message.reference is not None and content in SKIP_NEXT_KEYWORDS:
+        await skip_next_by_reply(message)
         return
 
     # 「<ID><キャンセルキーワード>」でIDを指定してキャンセル (例: "11トケ" "8やっぱなし")
@@ -1443,16 +1856,29 @@ async def on_message(message: discord.Message):
         await cancel_by_id_text(message, int(m.group(1)))
         return
 
+    # 「<ID><次だけスキップキーワード>」でIDを指定して次回分だけスキップ
+    m = SKIP_NEXT_BY_ID_RE.match(content)
+    if m:
+        await skip_next_by_id_text(message, int(m.group(1)))
+        return
+
     # 「今の予定」などで予約中リマインド一覧を表示
     if content in LIST_KEYWORDS:
         await show_reminders_in_chat(message)
         return
 
     now = datetime.now(JST)
-    parsed = parse_reminder(content, now)
-    if parsed is not None:
-        remind_at, text = parsed
 
+    # 繰り返しリマインド(「毎日21時 ご飯」等)を先に判定する。
+    # 通常パターンと語頭("毎日"等)が重ならないので、判定順はどちらが先でも実害はない。
+    repeat_parsed = parse_repeat_reminder(content, now)
+    if repeat_parsed is not None:
+        remind_at, text, repeat = repeat_parsed
+    else:
+        parsed = parse_reminder(content, now)
+        remind_at, text, repeat = (*parsed, None) if parsed is not None else (None, None, None)
+
+    if remind_at is not None:
         reminder = {
             "id": next_id(),
             "user_id": message.author.id,
@@ -1462,6 +1888,7 @@ async def on_message(message: discord.Message):
             "message": text,
             "created_at": now.isoformat(),
             "message_id": message.id,  # 元メッセージのID(リプライキャンセル判定用)
+            "repeat": repeat,  # None/"daily"/"weekly"/"monthly"
         }
         reminders.append(reminder)
         save_reminders(reminders)
@@ -1542,7 +1969,87 @@ async def cancel_by_id_text(message: discord.Message, reminder_id: int):
 
     await message.reply(f"{reminder_id}は忘れるね")
 
+
+async def _skip_next_occurrence(target: dict) -> str:
+    """繰り返しリマインドなら次回分だけ進めて残す。単発なら削除する(シリーズ解除と同じ結果)。
+    戻り値: ユーザーに返す一言。呼び出し側でsave_reminders済みの状態にする。
+    """
+    global reminders
+    repeat = target.get("repeat")
+    if repeat:
+        remind_at = datetime.fromisoformat(target["remind_at"])
+        target["remind_at"] = _next_occurrence(remind_at, repeat).isoformat()
+        save_reminders(reminders)
+        next_dt = datetime.fromisoformat(target["remind_at"])
+        return f"次({next_dt.strftime('%Y/%m/%d %H:%M')})はスキップして、その次からまた伝えるね"
+    else:
+        reminders = [r for r in reminders if r is not target]
+        save_reminders(reminders)
+        return "繰り返しじゃないから、これで終わりにするね"
+
+
+async def skip_next_by_reply(message: discord.Message):
+    """予約メッセージへの「次だけなし」リプライで、次回分だけスキップする"""
+    ref_id = message.reference.message_id
+    target = next(
+        (
+            r
+            for r in reminders
+            if r["user_id"] == message.author.id and r.get("message_id") == ref_id
+        ),
+        None,
+    )
+    if target is None:
+        await message.reply("なんのこと？")
+        return
+
+    reply_text = await _skip_next_occurrence(target)
+
+    if CANCEL_EMOJI:
+        try:
+            await message.add_reaction(CANCEL_EMOJI)
+        except Exception:
+            log.exception("リアクション付与に失敗しました")
+
+    await message.reply(reply_text)
+
+
+async def skip_next_by_id_text(message: discord.Message, reminder_id: int):
+    """「<ID><次だけスキップキーワード>」形式のメッセージで、次回分だけスキップする"""
+    target = next(
+        (
+            r
+            for r in reminders
+            if r["id"] == reminder_id and r["user_id"] == message.author.id
+        ),
+        None,
+    )
+    if target is None:
+        await message.reply(f"ID:{reminder_id}は知らない話")
+        return
+
+    reply_text = await _skip_next_occurrence(target)
+
+    if CANCEL_EMOJI:
+        try:
+            await message.add_reaction(CANCEL_EMOJI)
+        except Exception:
+            log.exception("リアクション付与に失敗しました")
+
+    await message.reply(reply_text)
+
   
+REPEAT_LABELS = {"daily": "毎日", "weekly": "毎週", "monthly": "毎月"}
+
+
+def _format_reminder_line(r: dict, with_id_prefix: bool = False) -> str:
+    dt = datetime.fromisoformat(r["remind_at"])
+    label = REPEAT_LABELS.get(r.get("repeat"))
+    tag = f"({label}) " if label else ""
+    id_part = f"[ID:{r['id']}]" if with_id_prefix else f"[{r['id']}]"
+    return f"{id_part} {dt.strftime('%Y/%m/%d %H:%M')} {tag}- {r['message']}"
+
+
 async def show_reminders_in_chat(message: discord.Message):
     """「今の予定」などのキーワードで呼ばれる一覧表示(!remindersと同内容)"""
     mine = [r for r in reminders if r["user_id"] == message.author.id]
@@ -1550,10 +2057,7 @@ async def show_reminders_in_chat(message: discord.Message):
         await message.reply("何も無いよ")
         return
     mine.sort(key=lambda r: r["remind_at"])
-    lines = []
-    for r in mine:
-        dt = datetime.fromisoformat(r["remind_at"])
-        lines.append(f"[{r['id']}] {dt.strftime('%Y/%m/%d %H:%M')} - {r['message']}")
+    lines = [_format_reminder_line(r) for r in mine]
     await message.reply("\n".join(lines))
 
 
@@ -1565,16 +2069,13 @@ async def list_reminders(ctx: commands.Context):
         await ctx.reply("何も無いよ")
         return
     mine.sort(key=lambda r: r["remind_at"])
-    lines = []
-    for r in mine:
-        dt = datetime.fromisoformat(r["remind_at"])
-        lines.append(f"[ID:{r['id']}] {dt.strftime('%Y/%m/%d %H:%M')} - {r['message']}")
+    lines = [_format_reminder_line(r, with_id_prefix=True) for r in mine]
     await ctx.reply("\n".join(lines))
 
 
 @bot.command(name="cancel")
 async def cancel_reminder(ctx: commands.Context, reminder_id: int):
-    """指定IDのリマインドをキャンセル (自分のものだけ)"""
+    """指定IDのリマインドをキャンセル (自分のものだけ、繰り返しでもシリーズごと解除)"""
     global reminders
     target = next(
         (r for r in reminders if r["id"] == reminder_id and r["user_id"] == ctx.author.id),
@@ -1586,6 +2087,20 @@ async def cancel_reminder(ctx: commands.Context, reminder_id: int):
     reminders = [r for r in reminders if r is not target]
     save_reminders(reminders)
     await ctx.reply(f"{reminder_id}は忘れるね")
+
+
+@bot.command(name="skipnext")
+async def skip_next_reminder(ctx: commands.Context, reminder_id: int):
+    """指定IDのリマインドを次回分だけスキップ(繰り返しでなければ!cancelと同じ結果)"""
+    target = next(
+        (r for r in reminders if r["id"] == reminder_id and r["user_id"] == ctx.author.id),
+        None,
+    )
+    if target is None:
+        await ctx.reply(f"{reminder_id}は知らない話")
+        return
+    reply_text = await _skip_next_occurrence(target)
+    await ctx.reply(reply_text)
 
 
 @bot.command(name="push")
@@ -1752,14 +2267,16 @@ def _is_duplicate_reminder(candidate: dict, existing: list) -> bool:
 
 
 # 人間が編集しやすいバックアップ用フォーマット:
-#   [ID] YYYY/MM/DD HH:MM | user:xxx channel:xxx guild:xxx msgid:xxx | メッセージ本文
+#   [ID] YYYY/MM/DD HH:MM | user:xxx channel:xxx guild:xxx msgid:xxx repeat:xxx | メッセージ本文
 BACKUP_LINE_RE = re.compile(
     r"^\[(\d+)\]\s+(\d{4})/(\d{1,2})/(\d{1,2})\s+(\d{1,2}):(\d{2})\s*\|\s*"
-    r"user:(\d+)\s+channel:(\d+)\s+guild:(\S+)\s+msgid:(\S+)\s*\|\s*(.+)$"
+    r"user:(\d+)\s+channel:(\d+)\s+guild:(\S+)\s+msgid:(\S+)"
+    r"(?:\s+repeat:(none|daily|weekly|monthly))?\s*\|\s*(.+)$"
 )
 
 # ユーザー設定(扱い方/呼ばれ方)行のフォーマット: USERPREF:user_id|style|呼び方
-USERPREF_LINE_RE = re.compile(r"^USERPREF:(\d+)\|(polite|normal|rough)\|(.*)$")
+# style は「|」を含まない任意の文字列(!unamoonで独自に追加したスタイル名も含む)を許容する。
+USERPREF_LINE_RE = re.compile(r"^USERPREF:(\d+)\|([^|]+)\|(.*)$")
 
 # Web Push購読情報行のフォーマット: PUSHSUB:user_id|購読情報のJSON(1行1端末)
 PUSHSUB_LINE_RE = re.compile(r"^PUSHSUB:(\d+)\|(.+)$")
@@ -1769,7 +2286,7 @@ def _format_backup_text(reminder_list: list, prefs: dict, push_subs: dict | None
     lines = [
         "# リマインドバックアップ",
         f"# 出力日時: {datetime.now(JST).strftime('%Y/%m/%d %H:%M')}",
-        "# [ID] 日時 | user:送信者ID channel:チャンネルID guild:サーバーID msgid:元メッセージID | メッセージ本文",
+        "# [ID] 日時 | user:送信者ID channel:チャンネルID guild:サーバーID msgid:元メッセージID repeat:繰り返し種別 | メッセージ本文",
         "",
     ]
     for r in sorted(reminder_list, key=lambda r: r["remind_at"]):
@@ -1777,7 +2294,8 @@ def _format_backup_text(reminder_list: list, prefs: dict, push_subs: dict | None
         lines.append(
             f"[{r['id']}] {dt.strftime('%Y/%m/%d %H:%M')} | "
             f"user:{r['user_id']} channel:{r['channel_id']} "
-            f"guild:{r.get('guild_id')} msgid:{r.get('message_id')} | {r['message']}"
+            f"guild:{r.get('guild_id')} msgid:{r.get('message_id')} "
+            f"repeat:{r.get('repeat') or 'none'} | {r['message']}"
         )
 
     lines.append("")
@@ -1984,7 +2502,7 @@ async def restore_reminders(ctx: commands.Context):
         (
             _old_id,
             year_s, month_s, day_s, hour_s, minute_s,
-            user_s, channel_s, guild_s, msgid_s,
+            user_s, channel_s, guild_s, msgid_s, repeat_s,
             text_body,
         ) = m.groups()
 
@@ -2000,6 +2518,7 @@ async def restore_reminders(ctx: commands.Context):
                 "message": text_body.strip(),
                 "created_at": datetime.now(JST).isoformat(),
                 "message_id": None if msgid_s == "None" else int(msgid_s),
+                "repeat": None if repeat_s in (None, "none") else repeat_s,
             }
         except Exception:
             skipped += 1
@@ -2029,6 +2548,10 @@ async def restore_reminders(ctx: commands.Context):
 async def reminder_loop():
     global reminders
     now = datetime.now(JST)
+
+    # 完了確認の確認送信は、新しいリマインドの有無に関わらず毎回チェックする。
+    await _check_completion_reminders(now)
+
     due = []
     remaining = []
     for r in reminders:
@@ -2057,8 +2580,30 @@ async def reminder_loop():
             _register_mention_followup(
                 r["user_id"], channel.id, r["message"], phrased, kind="reminder"
             )
+
+            # 完了確認: 監視対象チャンネル(REGISTER_CHANNEL_ID優先、未設定ならこのリマインドの
+            # チャンネル)でCOMPLETION_CHECK_DELAY_MINUTES以内に本人が何か発言しなければ、
+            # 1回だけ「わすれてない？」と確認する。
+            watch_channel_id = (
+                REGISTER_CHANNEL_ID if REGISTER_CHANNEL_ID is not None else r["channel_id"]
+            )
+            pending_completion_checks.setdefault(r["user_id"], []).append({
+                "channel_id": watch_channel_id,
+                "message": r["message"],
+                "check_at": (now + timedelta(minutes=COMPLETION_CHECK_DELAY_MINUTES)).isoformat(),
+            })
+
+            # 繰り返し設定があれば、削除せずに次回分を計算して残す
+            repeat = r.get("repeat")
+            if repeat:
+                next_r = dict(r)
+                next_r["remind_at"] = _next_occurrence(remind_at, repeat).isoformat()
+                remaining.append(next_r)
         except Exception:
             log.exception("リマインド送信に失敗しました: %s", r)
+            # 送信自体に失敗した場合は取りこぼさないよう、消さずに次回ループで再試行する
+            # (以前は失敗しても無条件で削除しており、レート制限等で予定が消える原因になっていた)
+            remaining.append(r)
 
     reminders = remaining
     save_reminders(reminders)
