@@ -342,6 +342,65 @@ async def phrase_reminder_message(text: str, user_id: int | None = None) -> str:
         return _fallback_phrase(text, nickname_to_use)
 
 
+# テンプレートフォールバック用(カンマ区切りで複数指定可能。{text} に元の予定内容が入る)
+COMPLETION_CHECK_TEMPLATES = [
+    t.strip()
+    for t in os.environ.get(
+        "COMPLETION_CHECK_TEMPLATES",
+        "{text}、やった？わすれてない？,{text}、できた？",
+    ).split(",")
+    if t.strip()
+]
+
+
+def _fallback_completion_check(text: str, nickname_to_use: str | None = None) -> str:
+    if not COMPLETION_CHECK_TEMPLATES:
+        phrased = f"{text}、やった？わすれてない？"
+    else:
+        try:
+            phrased = random.choice(COMPLETION_CHECK_TEMPLATES).format(text=text)
+        except Exception:
+            phrased = f"{text}、やった？わすれてない？"
+    if nickname_to_use:
+        return f"{nickname_to_use}、{phrased}"
+    return phrased
+
+
+def _build_completion_check_prompt(style: str, nickname_to_use: str | None) -> str:
+    """完了確認(反応が無かった予定について様子をうかがう一言)用のシステムプロンプトを組み立てる。"""
+    persona = (
+        _persona_prompt(style)
+        + "さっき伝えた予定について、時間が経ったのに相手から何の反応も無い状況です。"
+        + "「ちゃんとやった？」「わすれてない？」のように、軽く様子をうかがう一言を作ってください。"
+        + "予定の文言(単語・言い回し)はできるだけそのまま残し、大きく意訳しないでください。"
+        + "説明口調やテンプレっぽい定型文にはならないよう、普段の会話のノリで自然な一言にしてください。"
+    )
+    if nickname_to_use:
+        return (
+            persona
+            + f"相手のことを「{nickname_to_use}」と呼んで話しかけてください。"
+            + "1文だけ。絵文字なし。20文字前後で。前置きや説明・カギ括弧は付けず、一言だけを返してください。"
+        )
+    return (
+        persona
+        + "1文だけ。絵文字なし。20文字前後で。前置きや説明・カギ括弧は付けず、一言だけを返してください。"
+    )
+
+
+async def phrase_completion_check_message(text: str, user_id: int | None = None) -> str:
+    """完了確認の一言をキャラクターの口調で生成する。Gemini未設定/失敗時はテンプレートにフォールバック。"""
+    prefs = user_prefs.get(str(user_id)) if user_id is not None else None
+    style = (prefs or {}).get("style", "normal")
+    nickname = (prefs or {}).get("nickname")
+
+    include_name = bool(nickname) and random.random() < NAME_REMINDER_PROBABILITY
+    nickname_to_use = nickname if include_name else None
+
+    system_prompt = _build_completion_check_prompt(style, nickname_to_use)
+    reply = await _call_gemini(system_prompt, f"予定: {text}")
+    return reply or _fallback_completion_check(text, nickname_to_use)
+
+
 JST = ZoneInfo("Asia/Tokyo")
 
 RELATIVE_DAYS = {
@@ -702,7 +761,8 @@ async def _check_completion_reminders(now: datetime) -> None:
                 channel = bot.get_channel(entry["channel_id"]) or await bot.fetch_channel(
                     entry["channel_id"]
                 )
-                await channel.send(f"<@{user_id}> 「{entry['message']}」、やった？わすれてない？")
+                phrased = await phrase_completion_check_message(entry["message"], user_id)
+                await channel.send(f"<@{user_id}> {phrased}")
             except Exception:
                 log.exception("完了確認メッセージの送信に失敗しました")
             # 確認は1回までなので、送信の成否に関わらずここで追跡を終える
@@ -2586,14 +2646,11 @@ async def reminder_loop():
                 r["user_id"], channel.id, r["message"], phrased, kind="reminder"
             )
 
-            # 完了確認: 監視対象チャンネル(REGISTER_CHANNEL_ID優先、未設定ならこのリマインドの
-            # チャンネル)でCOMPLETION_CHECK_DELAY_MINUTES以内に本人が何か発言しなければ、
-            # 1回だけ「わすれてない？」と確認する。
-            watch_channel_id = (
-                REGISTER_CHANNEL_ID if REGISTER_CHANNEL_ID is not None else r["channel_id"]
-            )
+            # 完了確認: 通知したチャンネル(channel、= NOTIFY_CHANNEL_ID優先、未設定ならこの
+            # リマインドのチャンネル)でCOMPLETION_CHECK_DELAY_MINUTES以内に本人が何か発言
+            # しなければ、1回だけ「わすれてない？」と確認する。
             pending_completion_checks.setdefault(r["user_id"], []).append({
-                "channel_id": watch_channel_id,
+                "channel_id": channel.id,
                 "message": r["message"],
                 "check_at": (now + timedelta(minutes=COMPLETION_CHECK_DELAY_MINUTES)).isoformat(),
             })
