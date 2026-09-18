@@ -129,7 +129,7 @@ STYLE_EMOJIS = {
     "rough": "3️⃣",
 }
 EMOJI_STYLE_MAP = {v: k for k, v in STYLE_EMOJIS.items()}
-STYLE_NUMBER_MAP = {"1": "polite", "2": "normal", "3": "rough"}
+STYLE_NUMBER_MAP = {"1": "polite", "2": "normal", "3": "rough", "4641":"tencho"}
 
 
 def load_user_prefs():
@@ -198,6 +198,7 @@ STYLE_TONE_INSTRUCTIONS = {
     "polite": "相手は上司。丁寧な敬語で話す。",
     "normal": "相手は普通の関係。いつも通りのラフに話す。",
     "rough": "相手は友達。タメ口寄りの雑な言葉遣いで話す。",
+    "tencho": "相手はアルバイト先の店長。友達のようにラフに話す。"
 }
 
 
