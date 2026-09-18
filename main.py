@@ -12,6 +12,7 @@ import logging
 import os
 import random
 import re
+import unicodedata
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -1167,7 +1168,7 @@ def _looks_like_bot_command(content: str, now: datetime) -> bool:
     """予定登録/キャンセル/一覧表示など、既存コマンドっぽいメッセージかどうか。
     2ターン目待ちのユーザーがこれらを送った場合は、相槌より本来の処理を優先させるためのガード。
     """
-    content = content.strip()
+    content = unicodedata.normalize("NFKC", content.strip())
     if not content:
         return False
     if content in CANCEL_KEYWORDS or content in LIST_KEYWORDS or content in SKIP_NEXT_KEYWORDS:
@@ -1832,6 +1833,10 @@ async def on_message(message: discord.Message):
             .replace(f"<@!{bot.user.id}>", "")
         )
         content = re.sub(r"\s+", " ", content).strip()
+
+    # スマホのIME等で全角になりがちな数字・コロンを半角化してから判定する
+    # (「毎週火曜７：３０」のような全角入力でも日時パターンに一致するようにするため)。
+    content = unicodedata.normalize("NFKC", content)
 
     # 画像が添付されていれば、画像からのリマインド登録を試みる(登録チャンネルのみ)。
     # テキストの解析より先に判定する(画像+キャプションの組み合わせを横取りしないため)。
