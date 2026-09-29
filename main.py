@@ -12,6 +12,7 @@ import logging
 import os
 import random
 import re
+import signal
 import unicodedata
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -1753,7 +1754,68 @@ async def _try_auto_restore_from_sheet() -> None:
 intents = discord.Intents.default()
 intents.message_content = True  # Developer Portal でも有効化が必要
 
-bot = commands.Bot(command_prefix=COMMAND_PREFIX, intents=intents)
+# 起動直後(ログイン〜初期化完了まで)は「取り込み中」で表示し、on_readyの最後で通常表示に戻す。
+bot = commands.Bot(
+    command_prefix=COMMAND_PREFIX,
+    intents=intents,
+    status=discord.Status.dnd,
+)
+
+
+# ----------------------------------------------------------------------
+# ステータス表示(オンライン / 取り込み中 / オフライン表示)
+# ----------------------------------------------------------------------
+# - プロセスが落ちた・通信が切れた場合は、Discord側が自動でオフライン表示にする。
+# - 更新中(SIGUSR1を受信)は「取り込み中」。SIGUSR2で解除。
+# - リマインド送信がDEGRADED_FAILURE_THRESHOLD回連続で失敗したら、
+#   DEGRADED_STATUS(既定: invisible = オフライン表示)にする。1回でも成功すれば戻る。
+# ステータス変更はDiscord側に回数制限があるため、状態が変わったときだけ送る。
+
+DEGRADED_FAILURE_THRESHOLD = int(os.environ.get("DEGRADED_FAILURE_THRESHOLD", "3"))
+DEGRADED_STATUS = os.environ.get("DEGRADED_STATUS", "invisible").strip().lower()
+
+_maintenance_mode = False
+_consecutive_send_failures = 0
+_presence_state: str | None = None  # 最後にDiscordへ反映した状態
+
+
+def _desired_presence_state() -> str:
+    if _maintenance_mode:
+        return "maintenance"
+    if _consecutive_send_failures >= DEGRADED_FAILURE_THRESHOLD:
+        return "degraded"
+    return "online"
+
+
+def _status_for(state: str) -> discord.Status:
+    if state == "maintenance":
+        return discord.Status.dnd
+    if state == "degraded":
+        return discord.Status.idle if DEGRADED_STATUS == "idle" else discord.Status.invisible
+    return discord.Status.online
+
+
+async def refresh_presence(force: bool = False) -> None:
+    """現在の状態に合わせてステータス表示を更新する(変化がなければ何もしない)。"""
+    global _presence_state
+    state = _desired_presence_state()
+    if state == _presence_state and not force:
+        return
+    if not bot.is_ready():
+        return  # 接続前は反映できないので、on_readyで反映する
+    try:
+        await bot.change_presence(status=_status_for(state))
+        _presence_state = state
+        log.info("ステータスを変更しました: %s", state)
+    except Exception:
+        log.exception("ステータスの変更に失敗しました")
+
+
+async def _set_maintenance(enabled: bool) -> None:
+    global _maintenance_mode
+    _maintenance_mode = enabled
+    log.info("メンテナンスモード: %s", "ON" if enabled else "OFF")
+    await refresh_presence()
 
 
 @bot.event
@@ -1763,6 +1825,9 @@ async def on_ready():
         reminder_loop.start()
     if not _reminders_file_existed:
         await _try_auto_restore_from_sheet()
+    # 初期化が終わったので「取り込み中」から通常表示へ。
+    # (再接続でon_readyが再度呼ばれた場合も、ここで現在の状態を再反映する)
+    await refresh_presence(force=True)
 
 
 @bot.event
@@ -2611,7 +2676,7 @@ async def restore_reminders(ctx: commands.Context):
 
 @tasks.loop(seconds=20)
 async def reminder_loop():
-    global reminders
+    global reminders, _consecutive_send_failures
     now = datetime.now(JST)
 
     # 完了確認の確認送信は、新しいリマインドの有無に関わらず毎回チェックする。
@@ -2655,6 +2720,8 @@ async def reminder_loop():
                 "check_at": (now + timedelta(minutes=COMPLETION_CHECK_DELAY_MINUTES)).isoformat(),
             })
 
+            _consecutive_send_failures = 0
+
             # 繰り返し設定があれば、削除せずに次回分を計算して残す
             repeat = r.get("repeat")
             if repeat:
@@ -2663,12 +2730,14 @@ async def reminder_loop():
                 remaining.append(next_r)
         except Exception:
             log.exception("リマインド送信に失敗しました: %s", r)
+            _consecutive_send_failures += 1
             # 送信自体に失敗した場合は取りこぼさないよう、消さずに次回ループで再試行する
             # (以前は失敗しても無条件で削除しており、レート制限等で予定が消える原因になっていた)
             remaining.append(r)
 
     reminders = remaining
     save_reminders(reminders)
+    await refresh_presence()
 
 
 @reminder_loop.before_loop
@@ -2707,6 +2776,18 @@ async def main():
         raise RuntimeError("環境変数 DISCORD_TOKEN が設定されていません。")
 
     await start_web_server()
+
+    # シグナルでステータスを切り替えられるようにする(update-bot.shから使う)
+    #   SIGUSR1: 取り込み中にする / SIGUSR2: 取り込み中を解除する
+    #   SIGTERM: systemctl stop/restart時。きちんと切断して即オフライン表示にする
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(
+        signal.SIGUSR1, lambda: asyncio.create_task(_set_maintenance(True))
+    )
+    loop.add_signal_handler(
+        signal.SIGUSR2, lambda: asyncio.create_task(_set_maintenance(False))
+    )
+    loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(bot.close()))
 
     # ログイン(bot.start)がレート制限等で失敗した場合、そのままプロセスを落とすと
     # Renderがすぐ再起動 → 再ログイン試行 → まだブロック中で失敗、のループになり、
