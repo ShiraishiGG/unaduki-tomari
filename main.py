@@ -13,6 +13,7 @@ import os
 import random
 import re
 import signal
+import time
 import unicodedata
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -1763,16 +1764,30 @@ bot = commands.Bot(
 
 
 # ----------------------------------------------------------------------
-# ステータス表示(オンライン / 取り込み中 / オフライン表示)
+# ステータス表示
 # ----------------------------------------------------------------------
-# - プロセスが落ちた・通信が切れた場合は、Discord側が自動でオフライン表示にする。
-# - 更新中(SIGUSR1を受信)は「取り込み中」。SIGUSR2で解除。
-# - リマインド送信がDEGRADED_FAILURE_THRESHOLD回連続で失敗したら、
-#   DEGRADED_STATUS(既定: invisible = オフライン表示)にする。1回でも成功すれば戻る。
+# 優先度の高い順に:
+#   取り込み中(赤)   : 起動準備中、更新中(SIGUSR1を受信。SIGUSR2で解除)
+#   オフライン       : 外部要因。プロセス停止・通信断はDiscord側が自動で判定し、
+#                      リマインド送信がDEGRADED_FAILURE_THRESHOLD回連続で失敗した
+#                      場合もオフライン表示(invisible)にする。1回でも成功すれば戻る。
+#   オンライン(緑)   : Botがメッセージを送ったら(=何か喋ったら)
+#   退席中(黄)       : 最後に喋ってから一定時間(IDLE_AFTER_MINUTES_MIN〜MAXの
+#                      ランダム)経ったら。人間っぽく毎回少しずつ時間を変える。
 # ステータス変更はDiscord側に回数制限があるため、状態が変わったときだけ送る。
 
 DEGRADED_FAILURE_THRESHOLD = int(os.environ.get("DEGRADED_FAILURE_THRESHOLD", "3"))
-DEGRADED_STATUS = os.environ.get("DEGRADED_STATUS", "invisible").strip().lower()
+IDLE_AFTER_MINUTES_MIN = float(os.environ.get("IDLE_AFTER_MINUTES_MIN", "10"))
+IDLE_AFTER_MINUTES_MAX = float(os.environ.get("IDLE_AFTER_MINUTES_MAX", "20"))
+
+
+def _pick_idle_after_seconds() -> float:
+    lo, hi = sorted((IDLE_AFTER_MINUTES_MIN, IDLE_AFTER_MINUTES_MAX))
+    return random.uniform(lo, hi) * 60
+
+
+_last_activity_at = time.monotonic()
+_idle_after_seconds = _pick_idle_after_seconds()
 
 _maintenance_mode = False
 _consecutive_send_failures = 0
@@ -1784,6 +1799,8 @@ def _desired_presence_state() -> str:
         return "maintenance"
     if _consecutive_send_failures >= DEGRADED_FAILURE_THRESHOLD:
         return "degraded"
+    if time.monotonic() - _last_activity_at >= _idle_after_seconds:
+        return "idle"
     return "online"
 
 
@@ -1791,8 +1808,17 @@ def _status_for(state: str) -> discord.Status:
     if state == "maintenance":
         return discord.Status.dnd
     if state == "degraded":
-        return discord.Status.idle if DEGRADED_STATUS == "idle" else discord.Status.invisible
+        return discord.Status.invisible
+    if state == "idle":
+        return discord.Status.idle
     return discord.Status.online
+
+
+def _mark_active() -> None:
+    """Botが何か喋った時点を記録し、次に退席中になるまでの時間を選び直す。"""
+    global _last_activity_at, _idle_after_seconds
+    _last_activity_at = time.monotonic()
+    _idle_after_seconds = _pick_idle_after_seconds()
 
 
 async def refresh_presence(force: bool = False) -> None:
@@ -1811,6 +1837,26 @@ async def refresh_presence(force: bool = False) -> None:
         log.exception("ステータスの変更に失敗しました")
 
 
+@bot.listen("on_message")
+async def _presence_on_message(message: discord.Message):
+    # Bot自身のメッセージ(リマインド・返事・DMなど全部)をここで一括で拾う。
+    # 既存のon_messageには手を加えない。
+    if bot.user is not None and message.author.id == bot.user.id:
+        _mark_active()
+        await refresh_presence()
+
+
+@tasks.loop(seconds=60)
+async def presence_loop():
+    # 一定時間喋っていなければ退席中へ(変化がなければ何も送らない)
+    await refresh_presence()
+
+
+@presence_loop.before_loop
+async def before_presence_loop():
+    await bot.wait_until_ready()
+
+
 async def _set_maintenance(enabled: bool) -> None:
     global _maintenance_mode
     _maintenance_mode = enabled
@@ -1825,9 +1871,13 @@ async def on_ready():
         reminder_loop.start()
     if not _reminders_file_existed:
         await _try_auto_restore_from_sheet()
-    # 初期化が終わったので「取り込み中」から通常表示へ。
+    # 初期化が終わったので「取り込み中」から通常表示へ(起動直後はオンラインから始める)。
+    _mark_active()
     # (再接続でon_readyが再度呼ばれた場合も、ここで現在の状態を再反映する)
     await refresh_presence(force=True)
+    # 退席中への切り替え判定は、初期化が終わってから始める
+    if not presence_loop.is_running():
+        presence_loop.start()
 
 
 @bot.event
