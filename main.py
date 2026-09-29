@@ -15,7 +15,7 @@ import re
 import signal
 import time
 import unicodedata
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -28,6 +28,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 import web_push
+import spotify_queue
 
 # ----------------------------------------------------------------------
 # 設定
@@ -1928,6 +1929,42 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             log.exception("完了リアクションの送信に失敗しました")
 
 
+# ----------------------------------------------------------------------
+# コマンドの対話中(!unamoon の選択待ちなど)は、通常の会話処理を止める
+# ----------------------------------------------------------------------
+# wait_forで返事を待っている間も on_message は同じメッセージを受け取るため、
+# そのままだと「コマンドへの返事」に会話Botとしても反応してしまう(多重反応)。
+# 対話中の (ユーザーID, チャンネルID) を記録しておき、on_messageで素通りさせる。
+_dialog_sessions: dict[tuple[int, int], int] = {}
+
+# 対話が終わった直後に届いた最後の返事にも反応しないよう、解除を少し遅らせる
+DIALOG_RELEASE_DELAY_SECONDS = 3.0
+
+
+def _release_dialog(key: tuple[int, int]) -> None:
+    count = _dialog_sessions.get(key, 0) - 1
+    if count > 0:
+        _dialog_sessions[key] = count
+    else:
+        _dialog_sessions.pop(key, None)
+
+
+@contextmanager
+def _dialog_session(user_id: int, channel_id: int):
+    key = (user_id, channel_id)
+    _dialog_sessions[key] = _dialog_sessions.get(key, 0) + 1
+    try:
+        yield
+    finally:
+        asyncio.get_running_loop().call_later(
+            DIALOG_RELEASE_DELAY_SECONDS, _release_dialog, key
+        )
+
+
+def _in_dialog(message: discord.Message) -> bool:
+    return (message.author.id, message.channel.id) in _dialog_sessions
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -1940,6 +1977,17 @@ async def on_message(message: discord.Message):
     # コマンド ("!reminders" など) はコマンド処理に回す
     if message.content.startswith(COMMAND_PREFIX):
         await bot.process_commands(message)
+        return
+
+    # コマンドの対話中(返事待ち)なら、その返事はコマンド側に任せて会話等には反応しない
+    if _in_dialog(message):
+        return
+
+    # Spotify: オーナーのDMでのリクエスト受付ON/OFFと、受付中の曲リクエスト(誰でも可)。
+    # 受付OFFのときは何もせず、通常の処理にそのまま流す。
+    if await spotify_queue.handle_toggle(message):
+        return
+    if await spotify_queue.handle_request(message):
         return
 
     looks_like_command = _looks_like_bot_command(message.content, datetime.now(JST))
@@ -2318,6 +2366,25 @@ async def setup_push(ctx: commands.Context):
         await ctx.reply("DM送ったよ")
 
 
+@bot.command(name="spotify")
+async def setup_spotify(ctx: commands.Context):
+    """Spotify連携用のリンクをオーナーにDMで送る(オーナー専用)。"""
+    if not spotify_queue.is_configured():
+        await ctx.send("Spotify連携が設定されていません(環境変数を確認してね)")
+        return
+    if ctx.author.id != spotify_queue.OWNER_ID:
+        return
+    url = spotify_queue.create_link_url()
+    try:
+        await ctx.author.send(
+            "🎵 下のリンクを開いてSpotifyにログインすると連携できるよ(10分以内に開いてね)\n" + url
+        )
+        if not isinstance(ctx.channel, discord.DMChannel):
+            await ctx.send("DMに連携用のリンクを送ったよ")
+    except discord.Forbidden:
+        await ctx.send("DMを送れなかった…DMを受け取れる設定にしてね")
+
+
 @bot.command(name="pushtest")
 async def push_test(ctx: commands.Context):
     """Web Pushのテスト送信を行い、結果(購読の有無/送信成功・失敗)をそのまま返信する。
@@ -2342,6 +2409,11 @@ async def setup_persona(ctx: commands.Context):
         await ctx.reply("DM送らせてよ～")
         return
 
+    with _dialog_session(author.id, dm.id):
+        await _setup_persona_dialog(ctx, author, dm)
+
+
+async def _setup_persona_dialog(ctx: commands.Context, author, dm: discord.DMChannel):
     try:
         prompt_msg = await dm.send(
             "扱い方を選んでね！\n"
@@ -2540,21 +2612,22 @@ async def _resolve_recent_txt_attachment(ctx: commands.Context) -> discord.Attac
             and m.content.strip() in ("それで", "ちがうやつ")
         )
 
-    for created_at, attachment in candidates:
-        minutes_ago = max(0, int((now - created_at).total_seconds() // 60))
-        await ctx.reply(f"{minutes_ago}分前のやつでいい？")
-        try:
-            reply_msg = await bot.wait_for("message", check=confirm_check, timeout=60)
-        except asyncio.TimeoutError:
-            await ctx.reply("返事がおそーい")
-            return None
+    with _dialog_session(ctx.author.id, ctx.channel.id):
+        for created_at, attachment in candidates:
+            minutes_ago = max(0, int((now - created_at).total_seconds() // 60))
+            await ctx.reply(f"{minutes_ago}分前のやつでいい？")
+            try:
+                reply_msg = await bot.wait_for("message", check=confirm_check, timeout=60)
+            except asyncio.TimeoutError:
+                await ctx.reply("返事がおそーい")
+                return None
 
-        if reply_msg.content.strip() == "それで":
-            return attachment
-        # 「ちがうやつ」なら次の候補(より古いもの)を提示する
+            if reply_msg.content.strip() == "それで":
+                return attachment
+            # 「ちがうやつ」なら次の候補(より古いもの)を提示する
 
-    await ctx.reply("もう候補が無いや、送ってくれる？")
-    return None
+        await ctx.reply("もう候補が無いや、送ってくれる？")
+        return None
 
 
 @bot.command(name="sheetsync")
@@ -2809,6 +2882,7 @@ async def start_web_server():
     app.router.add_get("/", handle_health)
     app.router.add_get("/healthz", handle_health)
     web_push.register_routes(app)
+    spotify_queue.register_routes(app)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
