@@ -54,10 +54,23 @@ OFF_KEYWORDS = _split_env("SPOTIFY_OFF_KEYWORDS", "音楽おしまい,音楽終�
 # 「〇〇流して」の語尾として扱う言葉
 REQUEST_SUFFIXES = _split_env("SPOTIFY_REQUEST_SUFFIXES", "流して,かけて,再生して,キューに入れて,再生")
 
-# リクエストを受け付けるチャンネル(カンマ区切りのID)。空ならDMを含むどこでも受け付ける。
+# サーバー上で曲のリクエストを受け付けるチャンネル。DMは常に受け付ける。
+# 挨拶と同じチャンネル(GREETING_CHANNEL_ID)に加え、SPOTIFY_REQUEST_CHANNEL_IDS
+# (カンマ区切り)で追加のチャンネルも指定できる。
 REQUEST_CHANNEL_IDS = {
-    int(x) for x in os.environ.get("SPOTIFY_REQUEST_CHANNEL_IDS", "").split(",") if x.strip()
+    int(x)
+    for x in (
+        os.environ.get("SPOTIFY_REQUEST_CHANNEL_IDS", "").split(",")
+        + [os.environ.get("GREETING_CHANNEL_ID", "")]
+    )
+    if x.strip()
 }
+
+
+def _is_request_channel(message: discord.Message) -> bool:
+    if isinstance(message.channel, discord.DMChannel):
+        return True
+    return message.channel.id in REQUEST_CHANNEL_IDS
 
 TRACK_URL_RE = re.compile(
     r"(?:https?://open\.spotify\.com/(?:intl-[A-Za-z-]+/)?track/|spotify:track:)([A-Za-z0-9]{22})"
@@ -365,9 +378,8 @@ async def handle_request(message: discord.Message) -> bool:
         return False
     if not is_on():
         return await _reply_if_request_while_off(message)
-    if REQUEST_CHANNEL_IDS and not isinstance(message.channel, discord.DMChannel):
-        if message.channel.id not in REQUEST_CHANNEL_IDS:
-            return False
+    if not _is_request_channel(message):
+        return False
 
     content = unicodedata.normalize("NFKC", _MENTION_RE.sub("", message.content)).strip()
 
@@ -431,6 +443,8 @@ async def _reply_if_request_while_off(message: discord.Message) -> bool:
     """受付OFF中に、Bot宛て(DMかメンション)の曲リクエストが来たら「受付してない」とだけ返す。
     ここで止めないと会話AIに流れて、できたふりの返事をされてしまうため。
     Bot宛てでない(チャンネルで普通に曲を共有しているだけ等)なら何もしない。"""
+    if not _is_request_channel(message):
+        return False
     is_dm = isinstance(message.channel, discord.DMChannel)
     mentioned = message.client.user is not None and message.client.user in message.mentions
     if not (is_dm or mentioned):
