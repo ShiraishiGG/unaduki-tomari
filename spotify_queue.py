@@ -215,15 +215,29 @@ async def _get_track(track_id: str) -> dict | None:
 
 
 async def _search_track(query: str) -> dict | None:
-    candidates = [query]
-    # 「YOASOBIのアイドル」→「YOASOBI アイドル」でも探す
+    candidates = []
+    # 「アーティストの曲名」を、アーティスト名と曲名に分けた検索で先に試す。
+    # 曲名に「の」が含まれることもあるので、分け方を変えて最大3通り試す。
+    splits = 0
+    for i, ch in enumerate(query):
+        if ch == "の" and 0 < i < len(query) - 1:
+            artist, title = query[:i].strip(), query[i + 1:].strip()
+            if artist and title:
+                candidates.append(f'track:"{title}" artist:"{artist}"')
+                splits += 1
+                if splits >= 3:
+                    break
+    # 分けて見つからなければ、文章のまま・「の」を空白にした形でも探す
+    candidates.append(query)
     if "の" in query:
         candidates.append(query.replace("の", " ", 1))
+
     for q in candidates:
         status, data = await _api(
             "GET", "/search", {"q": q, "type": "track", "limit": 1, "market": "from_token"}
         )
         items = ((data or {}).get("tracks") or {}).get("items") or []
+        log.info("Spotify検索: q=%r status=%s 件数=%d", q, status, len(items))
         if status == 200 and items:
             return items[0]
     return None
