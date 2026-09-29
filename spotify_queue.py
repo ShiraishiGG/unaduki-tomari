@@ -35,6 +35,7 @@ PUBLIC_BASE_URL = (os.environ.get("PUBLIC_BASE_URL") or "").rstrip("/")
 REDIRECT_URI = f"{PUBLIC_BASE_URL}/spotify/callback"
 TOKEN_FILE = os.environ.get("SPOTIFY_TOKEN_FILE", "spotify_token.json")
 AUTO_OFF_HOURS = float(os.environ.get("SPOTIFY_AUTO_OFF_HOURS", "6"))
+MARKET = os.environ.get("SPOTIFY_MARKET", "JP")
 SCOPES = "user-modify-playback-state user-read-playback-state"
 
 
@@ -234,7 +235,7 @@ async def _search_track(query: str) -> dict | None:
 
     for q in candidates:
         status, data = await _api(
-            "GET", "/search", {"q": q, "type": "track", "limit": 1, "market": "from_token"}
+            "GET", "/search", {"q": q, "type": "track", "limit": 1, "market": MARKET}
         )
         items = ((data or {}).get("tracks") or {}).get("items") or []
         log.info("Spotify検索: q=%r status=%s 件数=%d", q, status, len(items))
