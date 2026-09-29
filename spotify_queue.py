@@ -355,7 +355,7 @@ async def handle_toggle(message: discord.Message) -> bool:
             _turn_off()
             await message.channel.send("はーい")
         else:
-            await message.channel.send("はーい、なに流そっか")
+            await message.channel.send("はーい")
         return True
     if any(kw in content for kw in ON_KEYWORDS):
         if not is_linked():
@@ -430,7 +430,7 @@ async def handle_request(message: discord.Message) -> bool:
         elif e.kind == "rate_limited":
             text = "ちょっと混み合ってるみたい。少し待ってね"
         else:
-            text = "🎵 うまく追加できなかった…"
+            text = "うまく追加できなかった…"
         await message.reply(text, mention_author=False)
         return True
 
@@ -446,7 +446,7 @@ async def _reply_if_request_while_off(message: discord.Message) -> bool:
     if not _is_request_channel(message):
         return False
     is_dm = isinstance(message.channel, discord.DMChannel)
-    mentioned = client.user is not None and client.user in message.mentions
+    mentioned = message.client.user is not None and message.client.user in message.mentions
     if not (is_dm or mentioned):
         return False
     content = unicodedata.normalize("NFKC", _MENTION_RE.sub("", message.content)).strip()
