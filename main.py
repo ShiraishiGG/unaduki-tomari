@@ -295,6 +295,53 @@ def _fallback_phrase(text: str, nickname_to_use: str | None = None) -> str:
     return phrased
 
 
+# ----------------------------------------------------------------------
+# Geminiが「存在しないURL」を作ってしまうのを防ぐ
+# ----------------------------------------------------------------------
+# 1. 指示文で「URLを作らない・できないことをできたふりをしない」と伝える
+# 2. それでも出てきたURLのうち、入力(相手の発言・会話履歴・指示文)に無いものは取り除く
+GEMINI_NO_URL_RULE = (
+    "\n\n【厳守】URL・リンク・楽曲IDなどを自分で作って書かないこと。"
+    "相手の発言に含まれていたURLをそのまま触れるのは構わない。"
+    "音楽を流す・曲を探す・予約するなど、自分にできない操作を頼まれても、"
+    "できたふりをせず、会話として自然に返すこと。"
+)
+
+_MD_LINK_RE = re.compile(r"\[([^\]\n]+)\]\((\S+?)\)")
+_URL_IN_TEXT_RE = re.compile(r"(?:https?://|www\.)[^\s<>「」『』（）()]+|spotify:[a-z]+:[A-Za-z0-9]+", re.I)
+_URL_TRAILING = ".,、。!！?？」』】>)"
+
+
+def _strip_invented_urls(text: str, *sources) -> str:
+    """入力に含まれていないURL(=Geminiが作ったもの)を返答から取り除く。"""
+    allowed = "\n".join(str(x) for x in sources if x)
+    removed = []
+
+    def _allowed(url: str) -> bool:
+        return url.rstrip(_URL_TRAILING) in allowed
+
+    def md_repl(m):
+        if _allowed(m.group(2)):
+            return m.group(0)
+        removed.append(m.group(2))
+        return m.group(1)
+
+    def url_repl(m):
+        url = m.group(0)
+        if _allowed(url):
+            return url
+        removed.append(url)
+        return ""
+
+    cleaned = _MD_LINK_RE.sub(md_repl, text)
+    cleaned = _URL_IN_TEXT_RE.sub(url_repl, cleaned)
+    if removed:
+        log.info("Geminiの返答から入力に無いURLを取り除きました: %s", removed)
+        cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
+
+
 async def phrase_reminder_message(text: str, user_id: int | None = None) -> str:
     """リマインド本文を会話っぽく言い換える。
     Gemini APIが使えればそれを使い、未設定/失敗時はテンプレートにフォールバックする。
@@ -317,7 +364,7 @@ async def phrase_reminder_message(text: str, user_id: int | None = None) -> str:
         "https://generativelanguage.googleapis.com/v1beta/models/"
         f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     )
-    system_prompt = _build_gemini_system_prompt(style, nickname_to_use)
+    system_prompt = _build_gemini_system_prompt(style, nickname_to_use) + GEMINI_NO_URL_RULE
     payload = {
         "systemInstruction": {"parts": [{"text": system_prompt}]},
         "contents": [{"parts": [{"text": f"予定: {text}"}]}],
@@ -339,6 +386,7 @@ async def phrase_reminder_message(text: str, user_id: int | None = None) -> str:
         phrased = (
             data["candidates"][0]["content"]["parts"][0]["text"].strip()
         )
+        phrased = _strip_invented_urls(phrased, text)
         return phrased or _fallback_phrase(text, nickname_to_use)
     except Exception:
         log.exception("Gemini API 呼び出し中にエラーが発生したためテンプレートを使用します")
@@ -825,7 +873,7 @@ async def _call_gemini(
     contents = list(history) if history else []
     contents.append({"role": "user", "parts": [{"text": user_content}]})
     payload = {
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "systemInstruction": {"parts": [{"text": system_prompt + GEMINI_NO_URL_RULE}]},
         "contents": contents,
         "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.9},
     }
@@ -838,6 +886,7 @@ async def _call_gemini(
                     return None
                 data = await resp.json()
         text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        text = _strip_invented_urls(text, user_content, history, system_prompt)
         return text or None
     except Exception:
         log.exception("Gemini API 呼び出し中にエラーが発生しました")
