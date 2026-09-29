@@ -183,8 +183,23 @@ user_prefs = load_user_prefs()
 # APIが使えない状態でもリマインド送信自体は必ず行われる。
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 GEMINI_TIMEOUT_SECONDS = float(os.environ.get("GEMINI_TIMEOUT_SECONDS", "30"))
+
+# Geminiの「考える深さ」。空ならモデルの既定(3.5 Flash-Liteはほぼ考えずに即答)。
+# minimal / low / medium / high を指定できる。
+# 考えた分のトークンも出力の上限(maxOutputTokens)に数えられるため、指定したときは
+# 返事が途中で切れないよう、上限にその分の余裕を自動で足す。
+GEMINI_THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "").strip().lower()
+_THINKING_HEADROOM = {"minimal": 256, "low": 1024, "medium": 4096, "high": 8192}
+
+
+def _gemini_generation_config(max_tokens: int, temperature: float) -> dict:
+    config = {"maxOutputTokens": max_tokens, "temperature": temperature}
+    if GEMINI_THINKING_LEVEL in _THINKING_HEADROOM:
+        config["maxOutputTokens"] = max_tokens + _THINKING_HEADROOM[GEMINI_THINKING_LEVEL]
+        config["thinkingConfig"] = {"thinkingLevel": GEMINI_THINKING_LEVEL}
+    return config
 
 # ----------------------------------------------------------------------
 # キャラクター設定 (全Gemini呼び出しで共通の土台)
@@ -321,7 +336,7 @@ async def phrase_reminder_message(text: str, user_id: int | None = None) -> str:
     payload = {
         "systemInstruction": {"parts": [{"text": system_prompt}]},
         "contents": [{"parts": [{"text": f"予定: {text}"}]}],
-        "generationConfig": {"maxOutputTokens": 60, "temperature": 0.9},
+        "generationConfig": _gemini_generation_config(60, 0.9),
     }
 
     try:
@@ -827,7 +842,7 @@ async def _call_gemini(
     payload = {
         "systemInstruction": {"parts": [{"text": system_prompt}]},
         "contents": contents,
-        "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.9},
+        "generationConfig": _gemini_generation_config(max_tokens, 0.9),
     }
     try:
         timeout = aiohttp.ClientTimeout(total=GEMINI_TIMEOUT_SECONDS)
@@ -871,7 +886,7 @@ async def _call_gemini_vision(
         "systemInstruction": {"parts": [{"text": system_prompt}]},
         "contents": [{"role": "user", "parts": parts}],
         # 日時抽出はJSONで正確に返してほしいので、会話系より温度は低め・トークンは多めにする
-        "generationConfig": {"maxOutputTokens": 200, "temperature": 0.2},
+        "generationConfig": _gemini_generation_config(200, 0.2),
     }
     try:
         timeout = aiohttp.ClientTimeout(total=GEMINI_TIMEOUT_SECONDS)
