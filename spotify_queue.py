@@ -352,7 +352,7 @@ async def handle_request(message: discord.Message) -> bool:
         return True
 
     desc = _describe(track) if track else "曲"
-    await message.reply(f{desc}を追加したよ", mention_author=False)
+    await message.reply(f"{desc}を追加したよ", mention_author=False)
     return True
 
 
