@@ -85,6 +85,16 @@ _REQUEST_RE = re.compile(
 )
 
 
+# main.pyから bind_client(bot) で渡してもらうDiscordクライアント。
+# (discord.Message には .client が無いため、自分で持っておく)
+_client: discord.Client | None = None
+
+
+def bind_client(client: discord.Client) -> None:
+    global _client
+    _client = client
+
+
 def is_configured() -> bool:
     return bool(CLIENT_ID and CLIENT_SECRET and OWNER_ID and PUBLIC_BASE_URL)
 
@@ -353,7 +363,7 @@ async def handle_toggle(message: discord.Message) -> bool:
     if any(kw in content for kw in OFF_KEYWORDS):
         if is_on():
             _turn_off()
-            await message.channel.send("はーい")
+            await message.channel.send("はーい、何流そっか")
         else:
             await message.channel.send("はーい")
         return True
@@ -430,7 +440,7 @@ async def handle_request(message: discord.Message) -> bool:
         elif e.kind == "rate_limited":
             text = "ちょっと混み合ってるみたい。少し待ってね"
         else:
-            text = "うまく追加できなかった…"
+            text = "🎵 うまく追加できなかった…"
         await message.reply(text, mention_author=False)
         return True
 
@@ -446,7 +456,8 @@ async def _reply_if_request_while_off(message: discord.Message) -> bool:
     if not _is_request_channel(message):
         return False
     is_dm = isinstance(message.channel, discord.DMChannel)
-    mentioned = message.client.user is not None and message.client.user in message.mentions
+    me = _client.user if _client is not None else None
+    mentioned = me is not None and me in message.mentions
     if not (is_dm or mentioned):
         return False
     content = unicodedata.normalize("NFKC", _MENTION_RE.sub("", message.content)).strip()
@@ -464,7 +475,9 @@ async def _reply_if_request_while_off(message: discord.Message) -> bool:
 
 async def _notify_owner(message: discord.Message, text: str) -> None:
     try:
-        owner = message.client.get_user(OWNER_ID) or await message.client.fetch_user(OWNER_ID)
+        if _client is None:
+            return
+        owner = _client.get_user(OWNER_ID) or await _client.fetch_user(OWNER_ID)
         await owner.send(text)
     except Exception:
         log.exception("オーナーへの通知に失敗しました")
