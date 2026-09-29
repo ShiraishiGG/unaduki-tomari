@@ -215,33 +215,87 @@ async def _get_track(track_id: str) -> dict | None:
         return None
 
 
+def _norm(s: str) -> str:
+    """比較用: 全角半角・大文字小文字・空白や記号の違いを無視する。"""
+    s = unicodedata.normalize("NFKC", s or "").lower()
+    return re.sub(r"[\W_]+", "", s)
+
+
+def _base_title(name: str) -> str:
+    """「曲名 - New Mix」「曲名 (feat. 〇〇)」などの付け足し部分を取り除く。"""
+    name = re.split(r"\s+-\s+", name or "")[0]
+    return re.sub(r"[\(\[（【].*?[\)\]）】]", "", name)
+
+
+def _match_score(
+    track: dict, nq: str, title_hints: list[str], artist_trusted: bool = False
+) -> float:
+    """検索結果が、送られた文章と本当に合っているかの点数。1以上で採用。
+    2   : アーティスト名も曲名も文章に含まれている
+    1.5 : 文章がまるごと曲名(アーティスト指定なしの「アイドル流して」など)
+    0.5 : 曲名は合っているがアーティストが違う(採用しない)
+    artist_trusted: Spotify側でアーティスト指定の検索をした結果(英語表記⇔日本語表記の
+    違いもSpotifyが吸収してくれている)なので、アーティストは合っているとみなす。
+    """
+    artists = [_norm(a.get("name", "")) for a in track.get("artists", [])]
+    artist_hit = artist_trusted or any(a and a in nq for a in artists)
+    t = _norm(_base_title(track.get("name", "")))
+    if not t:
+        return 0
+    title_hit = t in nq or any(len(h) >= 2 and h in t for h in map(_norm, title_hints))
+    if artist_hit and title_hit:
+        return 2
+    if t == nq:
+        return 1.5
+    return 0.5 if title_hit else 0
+
+
+async def _search_items(q: str, limit: int) -> list[dict]:
+    status, data = await _api(
+        "GET", "/search", {"q": q, "type": "track", "limit": limit, "market": MARKET}
+    )
+    items = ((data or {}).get("tracks") or {}).get("items") or []
+    log.info("Spotify検索: q=%r status=%s 件数=%d", q, status, len(items))
+    return items if status == 200 else []
+
+
 async def _search_track(query: str) -> dict | None:
-    candidates = []
-    # 「アーティストの曲名」を、アーティスト名と曲名に分けた検索で先に試す。
-    # 曲名に「の」が含まれることもあるので、分け方を変えて最大3通り試す。
-    splits = 0
+    nq = _norm(query)
+    # 「アーティストの曲名」の分け方の候補(曲名に「の」が入ることもあるので最大3通り)
+    splits = []
     for i, ch in enumerate(query):
         if ch == "の" and 0 < i < len(query) - 1:
             artist, title = query[:i].strip(), query[i + 1:].strip()
             if artist and title:
-                candidates.append(f'track:"{title}" artist:"{artist}"')
-                splits += 1
-                if splits >= 3:
+                splits.append((artist, title))
+                if len(splits) >= 3:
                     break
-    # 分けて見つからなければ、文章のまま・「の」を空白にした形でも探す
-    candidates.append(query)
-    if "の" in query:
-        candidates.append(query.replace("の", " ", 1))
 
-    for q in candidates:
-        status, data = await _api(
-            "GET", "/search", {"q": q, "type": "track", "limit": 1, "market": MARKET}
-        )
-        items = ((data or {}).get("tracks") or {}).get("items") or []
-        log.info("Spotify検索: q=%r status=%s 件数=%d", q, status, len(items))
-        if status == 200 and items:
-            return items[0]
-    return None
+    searches = []
+    for artist, title in splits:
+        searches.append((f'track:"{title}" artist:"{artist}"', 5, True))
+        # アーティスト名の表記ゆれ(空白の有無など)で上が外れても拾えるよう、曲名だけでも探す
+        searches.append((title, 10, False))
+    searches.append((query, 10, False))
+    if splits:
+        searches.append((query.replace("の", " ", 1), 10, False))
+
+    title_hints = [t for _, t in splits] + [query]
+    best, best_score, seen = None, 0.0, set()
+    for q, limit, artist_trusted in searches:
+        for item in await _search_items(q, limit):
+            if item.get("id") in seen:
+                continue
+            seen.add(item.get("id"))
+            score = _match_score(item, nq, title_hints, artist_trusted)
+            if score > best_score:
+                best, best_score = item, score
+        if best_score >= 2:
+            break
+    if best_score < 1:
+        log.info("Spotify検索: 文章に合う曲が見つかりませんでした: %r", query)
+        return None
+    return best
 
 
 async def _add_to_queue(track_id: str) -> None:
@@ -307,8 +361,10 @@ async def handle_toggle(message: discord.Message) -> bool:
 
 async def handle_request(message: discord.Message) -> bool:
     """受付ON中の曲リクエスト。処理したらTrue(それ以外は通常処理に回す)。"""
-    if not is_configured() or not is_on():
+    if not is_configured():
         return False
+    if not is_on():
+        return await _reply_if_request_while_off(message)
     if REQUEST_CHANNEL_IDS and not isinstance(message.channel, discord.DMChannel):
         if message.channel.id not in REQUEST_CHANNEL_IDS:
             return False
@@ -368,6 +424,27 @@ async def handle_request(message: discord.Message) -> bool:
 
     desc = _describe(track) if track else "曲"
     await message.reply(f"{desc}を追加したよ", mention_author=False)
+    return True
+
+
+async def _reply_if_request_while_off(message: discord.Message) -> bool:
+    """受付OFF中に、Bot宛て(DMかメンション)の曲リクエストが来たら「受付してない」とだけ返す。
+    ここで止めないと会話AIに流れて、できたふりの返事をされてしまうため。
+    Bot宛てでない(チャンネルで普通に曲を共有しているだけ等)なら何もしない。"""
+    is_dm = isinstance(message.channel, discord.DMChannel)
+    mentioned = message.client.user is not None and message.client.user in message.mentions
+    if not (is_dm or mentioned):
+        return False
+    content = unicodedata.normalize("NFKC", _MENTION_RE.sub("", message.content)).strip()
+    looks_like_request = (
+        TRACK_URL_RE.search(content)
+        or SHORT_URL_RE.search(content)
+        or OTHER_SPOTIFY_URL_RE.search(content)
+        or _REQUEST_RE.match(content)
+    )
+    if not looks_like_request:
+        return False
+    await message.reply("今は曲のリクエスト受け付けてないよ", mention_author=False)
     return True
 
 
