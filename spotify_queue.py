@@ -47,11 +47,11 @@ def _split_env(name: str, default: str) -> list[str]:
 
 
 # オーナーのDMでON/OFFを切り替えるキーワード(部分一致)
-ON_KEYWORDS = _split_env("SPOTIFY_ON_KEYWORDS", "音楽が聴きたい気分,音楽が聞きたい気分,音楽聴きたい,音楽聞きたい")
-OFF_KEYWORDS = _split_env("SPOTIFY_OFF_KEYWORDS", "音楽おしまい,音楽終わり,音楽おわり,リクエスト終了")
+ON_KEYWORDS = _split_env("SPOTIFY_ON_KEYWORDS", "音楽が聴きたい気分,音楽が聞きたい気分,音楽聴きたい,音楽聞きたい,ドライブしよ")
+OFF_KEYWORDS = _split_env("SPOTIFY_OFF_KEYWORDS", "音楽おしまい,音楽終わり,音楽おわり,リクエスト終了,ドライブおわり")
 
 # 「〇〇流して」の語尾として扱う言葉
-REQUEST_SUFFIXES = _split_env("SPOTIFY_REQUEST_SUFFIXES", "流して,かけて,再生して,キューに入れて")
+REQUEST_SUFFIXES = _split_env("SPOTIFY_REQUEST_SUFFIXES", "流して,かけて,再生して,キューに入れて,再生")
 
 # リクエストを受け付けるチャンネル(カンマ区切りのID)。空ならDMを含むどこでも受け付ける。
 REQUEST_CHANNEL_IDS = {
@@ -271,21 +271,20 @@ async def handle_toggle(message: discord.Message) -> bool:
     if any(kw in content for kw in OFF_KEYWORDS):
         if is_on():
             _turn_off()
-            await message.channel.send("🎵 曲のリクエスト受付を終了したよ")
+            await message.channel.send("はーい、何流そっか")
         else:
-            await message.channel.send("🎵 リクエスト受付はもともとOFFだよ")
+            await message.channel.send("はーい")
         return True
     if any(kw in content for kw in ON_KEYWORDS):
         if not is_linked():
             await message.channel.send(
-                "🎵 まだSpotifyと連携してないみたい。`!spotify` で連携してから、もう一回言ってね"
+                "Spotify教えてよ～"
             )
             return True
         _turn_on()
         hours = f"{AUTO_OFF_HOURS:g}"
         await message.channel.send(
-            f"🎵 曲のリクエスト受付を開始したよ!みんなが曲のURLか「〇〇流して」で追加できるよ。\n"
-            f"{hours}時間経つか、「音楽おしまい」って言ってくれたら終了するね"
+            f"楽しみだね"
         )
         return True
     return False
@@ -309,11 +308,11 @@ async def handle_request(message: discord.Message) -> bool:
     elif SHORT_URL_RE.search(content):
         track_id = await _resolve_short_url(SHORT_URL_RE.search(content).group(0))
         if track_id is None:
-            await message.reply("🎵 そのリンクから曲が見つからなかった…", mention_author=False)
+            await message.reply("そのリンクじゃ曲が見つからなかった…", mention_author=False)
             return True
     elif OTHER_SPOTIFY_URL_RE.search(content):
         await message.reply(
-            "🎵 アルバムやプレイリストはごめんね、曲(トラック)のURLだけ対応してるよ",
+            "アルバムやプレイリストはごめんね、曲のURLだけ対応してるよ",
             mention_author=False,
         )
         return True
@@ -332,7 +331,7 @@ async def handle_request(message: discord.Message) -> bool:
             track = await _search_track(query)
             if track is None:
                 await message.reply(
-                    f"🎵 「{query}」が見つからなかった…SpotifyのURLを貼ってくれると確実だよ",
+                    f"「{query}」が見つからなかった…SpotifyのURLを貼ってくれると確実だよ",
                     mention_author=False,
                 )
                 return True
@@ -341,19 +340,19 @@ async def handle_request(message: discord.Message) -> bool:
     except SpotifyError as e:
         log.warning("Spotifyへの追加に失敗しました: %s", e)
         if e.kind == "no_device":
-            text = "🎵 今Spotifyがどこでも再生されてないみたい…再生を始めてからもう一回送ってね"
+            text = "どこに追加したらいいかわかんないよ～"
         elif e.kind == "not_linked":
-            text = "🎵 Spotifyとの連携が切れちゃってるみたい。今は追加できないよ"
-            await _notify_owner(message, "🎵 Spotifyの連携が切れたみたい。`!spotify` で連携し直してね")
+            text = "Spotifyとの連携が切れちゃってるみたい"
+            await _notify_owner(message, "Spotifyとの連携が切れちゃってるみたい")
         elif e.kind == "rate_limited":
-            text = "🎵 ちょっと混み合ってるみたい。少し待ってからもう一回送ってね"
+            text = "ちょっと混み合ってるみたい。少し待ってね"
         else:
             text = "🎵 うまく追加できなかった…"
         await message.reply(text, mention_author=False)
         return True
 
     desc = _describe(track) if track else "曲"
-    await message.reply(f"🎵 キューに追加したよ: {desc}", mention_author=False)
+    await message.reply(f{desc}を追加したよ", mention_author=False)
     return True
 
 
@@ -417,7 +416,7 @@ async def handle_callback(request: web.Request) -> web.Response:
     _access_token = body["access_token"]
     _access_token_expires_at = time.time() + int(body.get("expires_in", 3600))
     log.info("Spotifyと連携しました")
-    return _html("🎵 Spotifyとの連携が完了しました。このページは閉じてOKです。")
+    return _html("Spotifyとの連携が完了！このページは閉じてOKだよ")
 
 
 def register_routes(app: web.Application) -> None:
