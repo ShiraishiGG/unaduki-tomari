@@ -446,7 +446,7 @@ async def _reply_if_request_while_off(message: discord.Message) -> bool:
     if not _is_request_channel(message):
         return False
     is_dm = isinstance(message.channel, discord.DMChannel)
-    mentioned = message.client.user is not None and message.client.user in message.mentions
+    mentioned = client.user is not None and client.user in message.mentions
     if not (is_dm or mentioned):
         return False
     content = unicodedata.normalize("NFKC", _MENTION_RE.sub("", message.content)).strip()
