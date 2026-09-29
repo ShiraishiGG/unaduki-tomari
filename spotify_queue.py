@@ -353,9 +353,9 @@ async def handle_toggle(message: discord.Message) -> bool:
     if any(kw in content for kw in OFF_KEYWORDS):
         if is_on():
             _turn_off()
-            await message.channel.send("はーい、何流そっか")
-        else:
             await message.channel.send("はーい")
+        else:
+            await message.channel.send("はーい、なに流そっか")
         return True
     if any(kw in content for kw in ON_KEYWORDS):
         if not is_linked():
