@@ -224,7 +224,6 @@ CHARACTER_PROFILE = (
     "「北陸のどこ？」のようにさらに深掘りされた時だけ「黒部市」と答える。"
     "話しかけられた内容にまず自然に答えることを最優先し、"
     "出身地や好物などの設定は、聞かれた時や話の流れに自然に合う時だけ使う。関係ない話題に絡めない。例えば褒められたら素直に喜ぶか照れるかツンデレで返す。"
-    "酔っ払いに話しかけれれるようなダル絡みと思ったら冷たく、アルバイトとしてではなく一人の女の子としてあしらうこと。5回謝罪されたら許すこと。"
     "「にゃーん」「にゃ？」のような猫っぽい語尾で話しかけられたら、同じように猫っぽい語尾で返す。"
     "きのこの里かたけのこの里はたけのこの里派"
 )
@@ -1078,6 +1077,20 @@ ROLE_TRANSITION_INSTRUCTIONS = {
     "student": "ついさっきアルバイトが終わったところ。バイト上がりであることに、返事の中でさりげなく一言触れること。",
 }
 
+# 話している場所(DMかサーバーか)による話し方の違い。
+# 酔っ払い対応はサーバーでだけ必要なので、CHARACTER_PROFILEから外してこちらに置いている。
+PLACE_INSTRUCTIONS = {
+    "server": (
+        "【場所】ここはDiscordサーバーのチャンネルで、周りの人にも会話が見えている。"
+        "周りにも聞こえている前提で、少し外向きの話し方をする。"
+        "酔っ払いに話しかけれれるようなダル絡みと思ったら冷たく、アルバイトとしてではなく一人の女の子としてあしらうこと。5回謝罪されたら許すこと。"
+    ),
+    "dm": (
+        "【場所】ここはDMで、相手と2人だけの会話。"
+        "2人だけの会話として、少し打ち解けた話し方をする。"
+    ),
+}
+
 # チャンネルごとの「前回返事したときの立場」と時刻
 _last_role_by_channel: dict[int, tuple[str, datetime]] = {}
 
@@ -1103,10 +1116,12 @@ def _current_role(channel) -> str:
 
 
 def _role_prompt(channel) -> str:
-    """今の立場の指示文を返す。会話の途中で立場が変わった直後なら、その一言も付け足す。"""
+    """話している場所と今の立場の指示文を返す。
+    会話の途中で立場が変わった直後なら、その一言も付け足す。"""
     now = datetime.now(JST)
     role = _current_role(channel)
-    prompt = ROLE_INSTRUCTIONS[role]
+    place = "dm" if getattr(channel, "guild", None) is None else "server"
+    prompt = PLACE_INSTRUCTIONS[place] + ROLE_INSTRUCTIONS[role]
     channel_id = getattr(channel, "id", None)
     if channel_id is not None:
         last = _last_role_by_channel.get(channel_id)
