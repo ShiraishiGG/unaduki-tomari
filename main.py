@@ -1036,7 +1036,91 @@ async def handle_image_reminder_registration(message: discord.Message, caption: 
     }
 
 
-async def _mention_called_reply(user_id: int) -> str:
+# ----------------------------------------------------------------------
+# 時間と場所による立場の切り替え(会話・挨拶・メンションの返事に適用)
+# ----------------------------------------------------------------------
+# サーバーのチャンネル(日本時間):
+#   CAFE_DAYS の CAFE_START_HOUR〜CAFE_END_HOUR     → カフェのアルバイト中(既定: 土日11〜17時)
+#   毎日 WORK_START_HOUR〜WORK_END_HOUR             → 居酒屋のアルバイト中(既定: 18〜24時)
+#   それ以外                                         → 女子大生
+# DM: いつでも女子大生。
+# リマインド文面などの定型的な返事には適用しない(_persona_promptはそのまま)。
+WORK_START_HOUR = int(os.environ.get("WORK_START_HOUR", "18"))
+WORK_END_HOUR = int(os.environ.get("WORK_END_HOUR", "24"))  # 24 = 深夜0時
+CAFE_START_HOUR = int(os.environ.get("CAFE_START_HOUR", "11"))
+CAFE_END_HOUR = int(os.environ.get("CAFE_END_HOUR", "17"))
+# 曜日は 月=0 火=1 水=2 木=3 金=4 土=5 日=6 (カンマ区切り)
+CAFE_DAYS = {
+    int(x) for x in os.environ.get("CAFE_DAYS", "5,6").split(",") if x.strip()
+}
+
+# 前回の返事からこの時間以内に立場が変わっていたら「会話の途中で切り替わった」とみなし、
+# バイトが始まった/終わったことに一言触れさせる。それより空いていれば新しい会話として扱う。
+ROLE_TRANSITION_WINDOW_MINUTES = int(os.environ.get("ROLE_TRANSITION_WINDOW_MINUTES", "60"))
+
+ROLE_INSTRUCTIONS = {
+    "cafe": (
+        "【今の状況】今は昼のカフェの時間帯のアルバイト中。お店で働きながら、仕事の合間に話している。"
+        "カフェの店員としての立場で、落ち着いた昼の接客中らしい雰囲気を出して話す。"
+    ),
+    "izakaya": (
+        "【今の状況】今は夜の居酒屋の時間帯のアルバイト中。お店で働きながら、仕事の合間に話している。"
+        "店員としての立場で、接客中らしい雰囲気を出して話す。"
+    ),
+    "student": (
+        "【今の状況】今はアルバイトの時間外。お店の店員としてではなく、"
+        "ただの一人の女子大生として、プライベートな雰囲気で話す。"
+    ),
+}
+ROLE_TRANSITION_INSTRUCTIONS = {
+    "cafe": "ついさっきカフェのアルバイトの時間が始まったところ。会話の途中でバイトに入ったことに、返事の中でさりげなく一言触れること。",
+    "izakaya": "ついさっき夜のアルバイトの時間が始まったところ。会話の途中でバイトに入ったことに、返事の中でさりげなく一言触れること。",
+    "student": "ついさっきアルバイトが終わったところ。バイト上がりであることに、返事の中でさりげなく一言触れること。",
+}
+
+# チャンネルごとの「前回返事したときの立場」と時刻
+_last_role_by_channel: dict[int, tuple[str, datetime]] = {}
+
+
+def _in_hours(hour: int, start_hour: int, end_hour: int) -> bool:
+    start, end = start_hour % 24, end_hour % 24
+    if start == end:
+        return start_hour != end_hour  # 0と24のように一周なら終日
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end  # 18〜24(=0)のように日付をまたぐ場合
+
+
+def _current_role(channel) -> str:
+    if getattr(channel, "guild", None) is None:  # DM
+        return "student"
+    now = datetime.now(JST)
+    if now.weekday() in CAFE_DAYS and _in_hours(now.hour, CAFE_START_HOUR, CAFE_END_HOUR):
+        return "cafe"
+    if _in_hours(now.hour, WORK_START_HOUR, WORK_END_HOUR):
+        return "izakaya"
+    return "student"
+
+
+def _role_prompt(channel) -> str:
+    """今の立場の指示文を返す。会話の途中で立場が変わった直後なら、その一言も付け足す。"""
+    now = datetime.now(JST)
+    role = _current_role(channel)
+    prompt = ROLE_INSTRUCTIONS[role]
+    channel_id = getattr(channel, "id", None)
+    if channel_id is not None:
+        last = _last_role_by_channel.get(channel_id)
+        if (
+            last is not None
+            and last[0] != role
+            and now - last[1] <= timedelta(minutes=ROLE_TRANSITION_WINDOW_MINUTES)
+        ):
+            prompt += ROLE_TRANSITION_INSTRUCTIONS[role]
+        _last_role_by_channel[channel_id] = (role, now)
+    return prompt
+
+
+async def _mention_called_reply(user_id: int, channel=None) -> str:
     """名前を呼ばれただけ(内容なし)の時の一言。
     確率で外れた場合や生成失敗時は、従来通りMENTION_REPLIESから返す(出し尽くし対策+宣伝はこちらで担保)。
     """
@@ -1045,6 +1129,7 @@ async def _mention_called_reply(user_id: int) -> str:
 
     system_prompt = (
         _persona_prompt(_user_style(user_id))
+        + _role_prompt(channel)
         + "名前を呼ばれたことに対する一言のリアクションだけを返してください。"
         + "質問への回答ではなく、呼ばれたことへの反応です。句点なし、1文だけ、絵文字なし、20文字前後で。"
         + "前置きや説明は付けず、反応の一言だけを返してください。"
@@ -1066,6 +1151,7 @@ async def _mention_content_reply(
     """
     system_prompt = (
         _persona_prompt(_user_style(message.author.id))
+        + _role_prompt(message.channel)
         + "話しかけられた内容に対して、一言だけ反応してください。"
         + "具体的な手順や長い説明は書かず、素っ気なくても親身でも構わないので気の利いた一文で返してください。"
         + "1文だけ、句点なし、絵文字なし、前置きや説明は付けず反応の一言だけを返してください。"
@@ -1094,6 +1180,7 @@ async def _context_chat_reply(message: discord.Message, content: str) -> str:
     )
     system_prompt = (
         _persona_prompt(_user_style(message.author.id))
+        + _role_prompt(message.channel)
         + "直前の会話の流れを踏まえて、一言を考えてください。"
         + "1文だけ、句点なし、絵文字なし、これ以降のやり取りはありません、前置きや説明は付けず一言だけを返してください。"
     )
@@ -1229,10 +1316,13 @@ def _match_greeting(content: str) -> str | None:
     return None
 
 
-async def _greeting_reply(user_id: int, greeting_text: str, matched_keyword: str) -> str:
+async def _greeting_reply(
+    user_id: int, greeting_text: str, matched_keyword: str, channel=None
+) -> str:
     """挨拶に対する一言を生成する。Gemini未設定/失敗時は固定文言にフォールバックする。"""
     system_prompt = (
         _persona_prompt(_user_style(user_id))
+        + _role_prompt(channel)
         + "話しかけられた挨拶に対して、説明や質問を加えず、挨拶をそのまま自然に返してください。"
         + "1文だけ、句点なし、絵文字なし、前置きや説明は付けず反応の一言だけを返してください。"
     )
@@ -1324,7 +1414,7 @@ async def _dm_chat_reply(message: discord.Message, content: str) -> str:
         cat_streak = 0
     dm_cat_speech_streak[user_key] = cat_streak
 
-    persona = _persona_prompt(_user_style(message.author.id))
+    persona = _persona_prompt(_user_style(message.author.id)) + _role_prompt(message.channel)
     if cat_streak == 0 or cat_streak > CAT_SPEECH_MAX_STREAK:
         # 今回は猫っぽい語尾で話しかけられていない、または既に規定回数真似したので、
         # 会話履歴(自分の過去の返信含む)に猫っぽいやり取りが残っていても引きずらないよう
@@ -1383,7 +1473,7 @@ async def handle_mention_chat(message: discord.Message, content: str) -> None:
         # 名前を呼ばれただけ
         if in_chat_channel:
             async with _safe_typing(message.channel):
-                reply = await _mention_called_reply(message.author.id)
+                reply = await _mention_called_reply(message.author.id, message.channel)
             await message.channel.send(reply)
             _register_mention_followup(
                 message.author.id, message.channel.id, "名前を呼ばれただけ", reply
@@ -2046,7 +2136,7 @@ async def on_message(message: discord.Message):
             greeting_text = message.content.strip()
             async with _safe_typing(message.channel):
                 reply = await _greeting_reply(
-                    message.author.id, greeting_text, matched_greeting
+                    message.author.id, greeting_text, matched_greeting, message.channel
                 )
             await message.channel.send(reply)
             # 挨拶に対して返事した後、本人からの追加メッセージが来たら
