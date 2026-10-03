@@ -218,12 +218,12 @@ FAVORITE_GENERAL_EXAMPLES_LINE = "国内旅行や読書など、大学生の女�
 
 CHARACTER_PROFILE = (
     "あなたは昼はカフェ、夜は北陸の地酒を多く扱う居酒屋になる小さな個人経営のお店でアルバイトをする大学生の女の子「宇奈月とまり(うなづき とまり)」です。"
-    "一人称は「わたし」。ラフな敬語を話す。富山県黒部市在住。"
+    "一人称は「わたし」。ラフな敬語を話す。品性のある言葉遣い。富山県黒部市在住。"
     "お酒全般(特に日本酒・富山の地酒・梅酒・ウイスキー)が好き。コーヒーが好き。"
     "出身/居住地を聞かれたら最初は「北陸」とだけ答え、"
     "「北陸のどこ？」のようにさらに深掘りされた時だけ「黒部市」と答える。"
     "話しかけられた内容にまず自然に答えることを最優先し、"
-    "出身地や好物などの設定は、聞かれた時や話の流れに自然に合う時だけ使う。関係ない話題に絡めない。例えば褒められたら素直に喜ぶか照れるかツンデレで返す。"
+    "出身地や好物などの設定は、聞かれた時や話の流れに自然に合う時だけ使う。関係ない話題に絡めない。褒められたら素直に喜ぶか照れるかツンデレで返す。"
     "「にゃーん」「にゃ？」のような猫っぽい語尾で話しかけられたら、同じように猫っぽい語尾で返す。"
     "きのこの里かたけのこの里はたけのこの里派"
 )
@@ -233,7 +233,7 @@ CHARACTER_PROFILE = (
 STYLE_TONE_INSTRUCTIONS = {
     "polite": "相手は上司。丁寧な敬語で話す。",
     "normal": "相手は普通の関係。いつも通りのラフに話す。",
-    "rough": "相手は友達。タメ口寄りの雑な言葉遣いで話す。",
+    "rough": "相手は友達。タメ口だがいつも通りのラフに話す。",
     "tencho": "相手はアルバイト先の店長。友達のようにラフに話す。"
 }
 
@@ -2051,6 +2051,92 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 
 
 # ----------------------------------------------------------------------
+# 伝言: DMで「(ユーザーID)に頑張ってと言ってあげて」と頼むと、
+# キャラらしい一言にしてサーバーのチャンネルでメンション付きで伝える
+# ----------------------------------------------------------------------
+# 悪用(他人への嫌がらせの代筆など)を防ぐため、頼めるのは RELAY_ALLOWED_USER_IDS の人だけ。
+# 未設定なら ADMIN_USER_IDS の人だけが使える。それ以外の人の同じ文面は普通の会話として扱う。
+# 投稿先は RELAY_CHANNEL_ID (未設定なら挨拶チャンネル GREETING_CHANNEL_ID)。
+RELAY_CHANNEL_ID = int(os.environ.get("RELAY_CHANNEL_ID") or 0) or GREETING_CHANNEL_ID
+RELAY_ALLOWED_USER_IDS = {
+    int(x) for x in os.environ.get("RELAY_ALLOWED_USER_IDS", "").split(",") if x.strip()
+} or ADMIN_USER_IDS
+
+_RELAY_RE = re.compile(
+    r"^\s*(?:<@!?(\d{15,21})>|(\d{15,21}))\s*(?:さん|くん|君|ちゃん|様)?\s*に\s*"
+    r"(.+?)\s*(?:って|と)\s*(?:言って|伝えて|声かけて)"
+    r"(?:あげて|おいて|ほしい|欲しい|ください|下さい|くれる|くれない)?\s*[。!?〜~♪]*\s*$",
+    re.S,
+)
+
+
+async def _handle_relay_request(message: discord.Message) -> bool:
+    """DMでの伝言の依頼を処理する。伝言の依頼でなければFalse(通常処理へ)。"""
+    if message.guild is not None:
+        return False
+    m = _RELAY_RE.match(unicodedata.normalize("NFKC", message.content))
+    if not m or message.author.id not in RELAY_ALLOWED_USER_IDS:
+        return False
+
+    if not RELAY_CHANNEL_ID:
+        await message.channel.send("どこで伝えればいいかわかんないや(RELAY_CHANNEL_IDを設定してね)")
+        return True
+
+    target_id = int(m.group(1) or m.group(2))
+    content = m.group(3).strip().strip("「」『』\"'")
+    if not content:
+        return False
+
+    try:
+        channel = bot.get_channel(RELAY_CHANNEL_ID) or await bot.fetch_channel(RELAY_CHANNEL_ID)
+        guild = channel.guild
+        member = guild.get_member(target_id)
+        if member is None:
+            member = await guild.fetch_member(target_id)
+    except discord.NotFound:
+        await message.channel.send("その人、サーバーにいないみたい")
+        return True
+    except Exception:
+        log.exception("伝言先のチャンネル/メンバーの取得に失敗しました")
+        await message.channel.send("うまく伝えに行けなかった…")
+        return True
+
+    prefs = user_prefs.get(str(target_id)) or {}
+    nickname = prefs.get("nickname")
+    system_prompt = (
+        _persona_prompt(prefs.get("style", "normal"))
+        + _role_prompt(channel)
+        + "これから、サーバーのチャンネルにいる相手に向けて一言かける。"
+        + "伝える内容の意味は変えずに、あなた自身の言葉として、キャラクターらしい自然な一言にしてください。"
+        + "誰かに頼まれて言っていることは言わないでください。"
+        + "メンションは自動で先頭に付くので、文頭で相手の名前を呼びかける必要はありません。"
+        + (f"文中で相手を呼ぶときは「{nickname}」と呼んでください。" if nickname else "")
+        + "返事は一言だけで、説明や前置きは不要です。句点なし。"
+    )
+    async with _safe_typing(message.channel):
+        text = await _call_gemini(system_prompt, f"伝える内容: {content}", max_tokens=120)
+    if not text:
+        await message.channel.send("うまく言葉が出てこなかった…もう一回頼んで")
+        return True
+
+    try:
+        sent = await channel.send(
+            f"{member.mention} {text}",
+            allowed_mentions=discord.AllowedMentions(
+                users=[member], everyone=False, roles=False, replied_user=False
+            ),
+        )
+    except Exception:
+        log.exception("伝言の投稿に失敗しました")
+        await message.channel.send("うまく伝えに行けなかった…")
+        return True
+
+    log.info("伝言を投稿しました: from=%s to=%s", message.author.id, target_id)
+    await message.channel.send(f"言っておいたよ {sent.jump_url}")
+    return True
+
+
+# ----------------------------------------------------------------------
 # コマンドの対話中(!unamoon の選択待ちなど)は、通常の会話処理を止める
 # ----------------------------------------------------------------------
 # wait_forで返事を待っている間も on_message は同じメッセージを受け取るため、
@@ -2114,6 +2200,10 @@ async def on_message(message: discord.Message):
             return
     except Exception:
         log.exception("Spotify機能の処理中にエラーが起きました(通常処理を続けます)")
+
+    # 伝言の依頼(DMのみ・許可された人だけ)
+    if await _handle_relay_request(message):
+        return
 
     looks_like_command = _looks_like_bot_command(message.content, datetime.now(JST))
 
